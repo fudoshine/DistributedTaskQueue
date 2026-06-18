@@ -93,6 +93,27 @@ func main() {
 		}
 	}()
 
+	go func() {
+		slog.Info("Janitor thread successfully started, monitoring for abandoned tasks...")
+
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ctx.Done():
+				slog.Info("Janitor thread received shutdown signal, exiting...")
+				return
+			case <-ticker.C:
+				err := store.SweepAbondonedTasks(ctx, queueName)
+				if err != nil {
+					slog.Error("Failed to sweep abandoned tasks", "error", err)
+				} else {
+					slog.Info("Janitor sweep completed successfully")
+				}
+			}
+		}
+	}()
 	<-ctx.Done()
 	slog.Info("Main thread received shutdown signal, waiting for worker and producer to finish...")
 	<-workerDone
