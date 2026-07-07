@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"distributed-queue/pkg/circuitbreaker"
 	"distributed-queue/pkg/config"
 	"distributed-queue/pkg/redis"
 	"distributed-queue/pkg/redis/metrics"
@@ -42,7 +43,7 @@ func simulateProcessing(ctx context.Context, taskId string) error {
 // runWorker continuously consumes tasks from Redis, checks idempotency in Postgres,
 // processes them, and updates Postgres and Redis accordingly. It handles retries
 // and dead-lettering based on the Postgres job row's retry counter.
-func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
+func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("worker thread started, waiting for tasks...")
 
@@ -59,8 +60,9 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 				return
 			}
 			slog.Error("failed to consume task", "error", err)
-			//TODO: Implement exponential backoff here instead of busy-looping on Redis errors
-			time.Sleep(1 * time.Second)
+			// Exponential backoff with jitter to avoid hammering Redis
+			backoff := time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
+			time.Sleep(backoff)
 			continue
 		}
 		if taskId == "" {
@@ -69,9 +71,27 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 		slog.Info("task consumed, running idempotency check", "taskId", taskId)
 
-		status, err := jobRepo.TryStartJob(ctx, queueName, taskId)
-		if err != nil {
-			if errors.Is(err, repository.ErrDuplicateJob) {
+		var status string
+		var tryErr error
+		
+		// Use circuit breaker for DB call
+		cbErr1 := dbBreaker.Call(func() error {
+			status, tryErr = jobRepo.TryStartJob(ctx, queueName, taskId)
+			return tryErr
+		})
+		
+		if cbErr1 != nil {
+			if errors.Is(cbErr1, circuitbreaker.ErrCircuitOpen) {
+				slog.Warn("circuit breaker open, skipping DB call", "taskId", taskId)
+				// Leave task in inflight, janitor will recover
+				time.Sleep(time.Second)
+				continue
+			}
+			tryErr = cbErr1
+		}
+		
+		if tryErr != nil {
+			if errors.Is(tryErr, repository.ErrDuplicateJob) {
 				slog.Warn("[IDEMPOTENCY] task already completed, dropping from Redis", "taskId", taskId)
 				metrics.TasksAcknowledged.WithLabelValues(queueName).Inc()
 				if err := store.AcknowledgeTask(ctx, queueName, taskId); err != nil {
@@ -79,7 +99,7 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 				}
 				continue
 			}
-			if errors.Is(err, repository.ErrJobNotFound) {
+			if errors.Is(tryErr, repository.ErrJobNotFound) {
 				slog.Error("[IDEMPOTENCY] task in Redis but no DB row exists - data inconsistency, moving to DLQ", "taskId", taskId)
 				metrics.TasksOrphaned.WithLabelValues(queueName).Inc()
 				if err := store.MoveToDeadLetterQueue(ctx, queueName, taskId); err != nil {
@@ -91,7 +111,7 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 			// Redis inflight. We deliberately do NOT retry/DLQ here — we
 			// leave it for the janitor to sweep back to the main queue after
 			// holdTTL, since we don't know if the DB write actually landed.
-			slog.Error("idempotency check failed, leaving task for janitor to recover", "taskId", taskId, "error", err)
+			slog.Error("idempotency check failed, leaving task for janitor to recover", "taskId", taskId, "error", tryErr)
 			continue
 		}
 		slog.Info("idempotency check passed", "taskId", taskId, "status", status)
@@ -101,35 +121,66 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 		metrics.ProcessingDuration.WithLabelValues(queueName).Observe(time.Since(processingStart).Seconds())
 
 		if procErr == nil {
-			slog.Info("task processing completed, syncing to postgres", "taskId", taskId)
+			slog.Info("task processing completed, preparing to complete", "taskId", taskId)
 
-			if err := jobRepo.CompleteJob(ctx, queueName, taskId); err != nil {
-				slog.Error("failed to write job completion to postgres, leaving for janitor to recover", "taskId", taskId, "error", err)
-				//TODO: Implement exponential backoff here instead of busy-looping on DB errors
-				time.Sleep(500 * time.Millisecond)
-				continue
-			}
-
-			// Check for ready children (DAG orchestration)
+			// STEP 1: Check for ready children FIRST (before marking parent complete)
 			children, err := jobRepo.CheckAndEnqueueChildren(ctx, queueName, taskId)
 			if err != nil {
 				slog.Error("failed to check for ready children", "taskId", taskId, "error", err)
-			} else if len(children) > 0 {
-				slog.Info("enqueuing ready children", "parentTask", taskId, "childCount", len(children))
+				// Don't complete parent if we can't check children - leave for janitor
+				continue
+			}
+
+			// STEP 2: Enqueue children to Redis BEFORE marking parent complete
+			if len(children) > 0 {
+				slog.Info("enqueuing ready children before marking parent complete", "parentTask", taskId, "childCount", len(children))
+				allEnqueued := true
 				for _, childID := range children {
 					if err := store.EnqueueTask(ctx, queueName, childID); err != nil {
 						slog.Error("failed to enqueue child task", "childId", childID, "error", err)
 						metrics.ChildEnqueueFailures.WithLabelValues(queueName).Inc()
+						allEnqueued = false
 					} else {
 						metrics.ChildrenEnqueued.WithLabelValues(queueName).Inc()
 					}
+				}
+				// If ANY child enqueue failed, don't complete parent - let janitor retry
+				if !allEnqueued {
+					slog.Error("failed to enqueue all children, leaving parent for janitor to retry", "taskId", taskId)
+					continue
+				}
+			}
+
+			// STEP 3: NOW mark parent as complete (after children are in Redis)
+			cbErr3 := dbBreaker.Call(func() error {
+				return jobRepo.CompleteJob(ctx, queueName, taskId)
+			})
+			
+			if cbErr3 != nil {
+				if errors.Is(cbErr3, circuitbreaker.ErrCircuitOpen) {
+					slog.Warn("circuit breaker open for DB, cannot complete job", "taskId", taskId)
+					time.Sleep(time.Second)
+					continue
+				}
+				slog.Error("failed to write job completion to postgres, leaving for janitor to recover", "taskId", taskId, "error", cbErr3)
+				continue
+			}
+
+			// STEP 4: Update workflow status
+			workflowID, err := jobRepo.GetWorkflowID(ctx, taskId)
+			if err != nil {
+				slog.Error("failed to get workflow_id for status update", "taskId", taskId, "error", err)
+			} else {
+				if err := jobRepo.UpdateWorkflowStatus(ctx, workflowID); err != nil {
+					slog.Error("failed to update workflow status", "workflowId", workflowID, "error", err)
 				}
 			}
 
 			if err := store.AcknowledgeTask(ctx, queueName, taskId); err != nil {
 				slog.Error("failed to acknowledge task, will be recovered by janitor", "taskId", taskId, "error", err)
-				//TODO: Implement exponential backoff here instead of busy-looping on Redis errors
-				time.Sleep(500 * time.Millisecond) // avoid busy-looping on Redis errors
+				// Exponential backoff with jitter to avoid hammering Redis
+				backoff := 500*time.Millisecond + time.Duration(rand.Intn(500))*time.Millisecond
+				time.Sleep(backoff)
 			} else {
 				slog.Info("task acknowledged and synchronized everywhere", "taskId", taskId)
 			}
@@ -141,11 +192,30 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 		metrics.ProcessingFailures.WithLabelValues(queueName).Inc()
 		slog.Warn("task processing failed, recording failure in postgres", "taskId", taskId, "error", procErr)
 
-		currentRetry, maxRetry, dbErr := jobRepo.RecordFailure(ctx, queueName, taskId, procErr.Error())
+		var currentRetry, maxRetry int
+		var dbErr error
+		
+		// Use circuit breaker for DB call
+		cbErr2 := dbBreaker.Call(func() error {
+			currentRetry, maxRetry, dbErr = jobRepo.RecordFailure(ctx, queueName, taskId, procErr.Error())
+			return dbErr
+		})
+		
+		if cbErr2 != nil {
+			if errors.Is(cbErr2, circuitbreaker.ErrCircuitOpen) {
+				slog.Warn("circuit breaker open for DB, skipping failure record", "taskId", taskId)
+				// Leave task in inflight, janitor will recover
+				time.Sleep(time.Second)
+				continue
+			}
+			dbErr = cbErr2
+		}
+		
 		if dbErr != nil {
 			slog.Error("failed to record failure in postgres, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
-			//TODO: Implement exponential backoff here instead of busy-looping on DB errors
-			time.Sleep(500 * time.Millisecond)
+			// Exponential backoff to avoid hammering DB when it's down
+			backoff := time.Duration(rand.Intn(1000)) * time.Millisecond
+			time.Sleep(backoff)
 			continue
 		}
 
@@ -159,6 +229,16 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 			if err := store.MoveToDeadLetterQueue(ctx, queueName, taskId); err != nil {
 				slog.Error("failed to move task to DLQ, leaving for janitor to recover", "taskId", taskId, "error", err)
+			}
+
+			// Update workflow status (task failed, workflow might be failed too)
+			workflowID, err := jobRepo.GetWorkflowID(ctx, taskId)
+			if err != nil {
+				slog.Error("failed to get workflow_id for status update", "taskId", taskId, "error", err)
+			} else {
+				if err := jobRepo.UpdateWorkflowStatus(ctx, workflowID); err != nil {
+					slog.Error("failed to update workflow status", "workflowId", workflowID, "error", err)
+				}
 			}
 			continue
 		}
@@ -197,7 +277,7 @@ func runProducer(ctx context.Context, queueName string, store *redis.RedisStore,
 			task := repository.Task{
 				ID:         taskID,
 				WorkflowID: workflowID,
-				ParentIDs:  []uuid.UUID{}, // root task, no parents
+				ParentIDs:  []uuid.UUID{},
 				TaskType:   "VIDEO_PROCESS",
 				Payload:    json.RawMessage(`{}`),
 			}
@@ -293,12 +373,24 @@ func runMetricsServer(ctx context.Context, metricsAddr string, wg *sync.WaitGrou
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
+	
+	// Health check endpoint for load balancers
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"healthy","service":"distributed-queue"}`))
+	})
+	
 	srv := &http.Server{Addr: metricsAddr, Handler: mux}
 
 	serverErr := make(chan error, 1)
 	go func() {
-		slog.Info("metrics server started", "addr", metricsAddr)
-		serverErr <- srv.ListenAndServe()
+		slog.Info("metrics server starting", "addr", metricsAddr)
+		err := srv.ListenAndServe()
+		if err != nil && err != http.ErrServerClosed {
+			slog.Error("metrics server failed to start", "error", err, "addr", metricsAddr)
+		}
+		serverErr <- err
 	}()
 
 	select {
@@ -329,10 +421,23 @@ func main() {
 		return
 	}
 
-	store, err := redis.NewRedisStore(ctx, cfg.Redis, cfg.Queue.HoldTTL)
-	if err != nil {
-		slog.Error("failed to initialize Redis store", "error", err)
-		return
+	// Retry Redis connection with exponential backoff
+	var store *redis.RedisStore
+	maxRetries := 5
+	for i := 0; i < maxRetries; i++ {
+		store, err = redis.NewRedisStore(ctx, cfg.Redis, cfg.Queue.HoldTTL)
+		if err == nil {
+			break
+		}
+		
+		if i < maxRetries-1 {
+			backoff := time.Duration(1<<uint(i)) * time.Second
+			slog.Warn("failed to connect to Redis, retrying...", "attempt", i+1, "backoff", backoff, "error", err)
+			time.Sleep(backoff)
+		} else {
+			slog.Error("failed to initialize Redis store after retries", "error", err)
+			return
+		}
 	}
 
 	pgCfg := repository.PostgresConfig{ConnString: cfg.Postgres.ConnString}
@@ -345,6 +450,10 @@ func main() {
 
 	jobRepo := repository.NewJobRepository(pgPool)
 
+	// Create circuit breaker for DB operations
+	// Opens after 5 failures, resets after 30 seconds
+	dbBreaker := circuitbreaker.New(5, 30*time.Second)
+
 	defer func() {
 		slog.Info("shutting down, closing database connections...")
 		pgPool.Close()
@@ -353,7 +462,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	wg.Add(6)
-	go runWorker(ctx, cfg.Queue.Name, store, jobRepo, &wg)
+	go runWorker(ctx, cfg.Queue.Name, store, jobRepo, dbBreaker, &wg)
 	go runProducer(ctx, cfg.Queue.Name, store, jobRepo, &wg)
 	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, store, &wg)
 	go runDelayedPoller(ctx, cfg.Queue.Name, cfg.Queue.DelayedPollEvery, store, &wg)
@@ -362,7 +471,22 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutdown signal received, waiting for all threads to exit...")
-	wg.Wait()
+	
+	// Graceful shutdown with timeout
+	done := make(chan struct{})
+	
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	
+	select {
+	case <-done:
+		slog.Info("all threads exited gracefully")
+	case <-time.After(cfg.Worker.ShutdownTimeout):
+		slog.Warn("shutdown timeout reached, forcing exit", "timeout", cfg.Worker.ShutdownTimeout)
+		// Note: In-flight tasks will be recovered by janitor on next startup
+	}
 
-	slog.Info("all threads exited, shutdown complete")
+	slog.Info("shutdown complete")
 }

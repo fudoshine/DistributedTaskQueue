@@ -353,3 +353,102 @@ func (r *JobRepository) MarkAsCancelledCascading(ctx context.Context, queueName,
 	}
 	return nil
 }
+
+// UpdateWorkflowStatus checks all jobs in a workflow and updates the workflow
+// status based on aggregate job states:
+// - RUNNING: If any job is RUNNING
+// - FAILED: If all jobs are terminal and at least one FAILED
+// - COMPLETED: If all jobs are COMPLETED
+// - PENDING: Otherwise
+func (r *JobRepository) UpdateWorkflowStatus(ctx context.Context, workflowID uuid.UUID) error {
+	query := `
+		UPDATE workflows w
+		SET status = CASE
+			-- If any job is RUNNING, workflow is RUNNING
+			WHEN EXISTS (
+				SELECT 1 FROM processed_jobs 
+				WHERE workflow_id = $1 AND status = $2
+			) THEN $2
+			
+			-- If all jobs are terminal (COMPLETED/FAILED/CANCELLED)
+			WHEN NOT EXISTS (
+				SELECT 1 FROM processed_jobs 
+				WHERE workflow_id = $1 
+				  AND status NOT IN ($3, $4, $5)
+			) THEN 
+				-- If any job FAILED, workflow FAILED
+				CASE 
+					WHEN EXISTS (
+						SELECT 1 FROM processed_jobs 
+						WHERE workflow_id = $1 AND status = $4
+					) THEN $4
+					-- Otherwise all COMPLETED/CANCELLED, workflow COMPLETED
+					ELSE $3
+				END
+			
+			-- Otherwise keep current status (PENDING or RUNNING)
+			ELSE w.status
+		END,
+		updated_at = NOW()
+		WHERE id = $1
+		  AND status != CASE
+			WHEN EXISTS (
+				SELECT 1 FROM processed_jobs 
+				WHERE workflow_id = $1 AND status = $2
+			) THEN $2
+			WHEN NOT EXISTS (
+				SELECT 1 FROM processed_jobs 
+				WHERE workflow_id = $1 
+				  AND status NOT IN ($3, $4, $5)
+			) THEN 
+				CASE 
+					WHEN EXISTS (
+						SELECT 1 FROM processed_jobs 
+						WHERE workflow_id = $1 AND status = $4
+					) THEN $4
+					ELSE $3
+				END
+			ELSE w.status
+		END;  -- Only update if status actually changed
+	`
+
+	tag, err := r.pool.Exec(ctx, query, workflowID, StatusRunning, StatusCompleted, StatusFailed, StatusCancelled)
+	if err != nil {
+		metrics.JobRepoErrors.WithLabelValues("_workflow", "UpdateWorkflowStatus").Inc()
+		return fmt.Errorf("failed to update workflow status: %w", err)
+	}
+
+	if tag.RowsAffected() > 0 {
+		// Check what the new status is to increment appropriate metric
+		var newStatus string
+		checkQuery := `SELECT status FROM workflows WHERE id = $1;`
+		if err := r.pool.QueryRow(ctx, checkQuery, workflowID).Scan(&newStatus); err == nil {
+			if newStatus == StatusCompleted {
+				metrics.WorkflowsCompleted.Inc()
+				slog.Info("[WORKFLOW] completed", "workflowId", workflowID)
+			} else if newStatus == StatusFailed {
+				metrics.WorkflowsFailed.Inc()
+				slog.Warn("[WORKFLOW] failed", "workflowId", workflowID)
+			} else {
+				slog.Info("[WORKFLOW] status updated", "workflowId", workflowID, "status", newStatus)
+			}
+		}
+	}
+	return nil
+}
+
+// GetWorkflowID retrieves the workflow_id for a given task.
+func (r *JobRepository) GetWorkflowID(ctx context.Context, taskID string) (uuid.UUID, error) {
+	id, err := uuid.Parse(taskID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
+	}
+
+	var workflowID uuid.UUID
+	query := `SELECT workflow_id FROM processed_jobs WHERE id = $1;`
+	err = r.pool.QueryRow(ctx, query, id).Scan(&workflowID)
+	if err != nil {
+		return uuid.Nil, fmt.Errorf("failed to get workflow_id for task %s: %w", taskID, err)
+	}
+	return workflowID, nil
+}

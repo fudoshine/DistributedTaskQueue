@@ -35,3 +35,7 @@ vendor/
 tmp/
 *.tmp
 *.log
+
+# Docs not referenced in README
+docs/METRICS_GUIDE.md
+docs/SYSTEM_FLOW_DIAGRAMS.md

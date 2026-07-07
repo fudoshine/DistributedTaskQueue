@@ -160,6 +160,18 @@ var (
 		Help: "Total workflows created.",
 	})
 
+	// WorkflowsCompleted tracks successful workflow completion.
+	WorkflowsCompleted = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "queue_workflows_completed_total",
+		Help: "Total workflows that completed successfully (all tasks COMPLETED).",
+	})
+
+	// WorkflowsFailed tracks failed workflows.
+	WorkflowsFailed = promauto.NewCounter(prometheus.CounterOpts{
+		Name: "queue_workflows_failed_total",
+		Help: "Total workflows that failed (at least one task FAILED).",
+	})
+
 	// TasksCancelledCascade counts tasks cancelled due to parent failure.
 	// High values indicate many blocked DAG branches.
 	TasksCancelledCascade = promauto.NewCounterVec(prometheus.CounterOpts{
