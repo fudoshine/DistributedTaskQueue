@@ -154,6 +154,19 @@ var (
 		Help: "Total tasks found in Redis without corresponding DB row (data inconsistency).",
 	}, []string{"queue"})
 
+	// OrphansReconciled counts PENDING DB rows re-enqueued to Redis by the
+	// orphan reconciler (WAL recovery: DB write succeeded, Redis enqueue failed).
+	OrphansReconciled = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "queue_orphans_reconciled_total",
+		Help: "Total PENDING tasks re-enqueued to Redis by the orphan reconciler.",
+	}, []string{"queue"})
+
+	// OutboxRelayed counts tasks successfully relayed from the outbox to Redis.
+	OutboxRelayed = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "queue_outbox_relayed_total",
+		Help: "Total tasks relayed from the transactional outbox to Redis.",
+	}, []string{"queue"})
+
 	// WorkflowsCreated tracks workflow creation for capacity planning.
 	WorkflowsCreated = promauto.NewCounter(prometheus.CounterOpts{
 		Name: "queue_workflows_created_total",

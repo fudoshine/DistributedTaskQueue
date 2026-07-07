@@ -37,3 +37,20 @@ CREATE INDEX idx_jobs_workflow_id ON processed_jobs(workflow_id);
 CREATE INDEX idx_jobs_status ON processed_jobs(status);
 CREATE INDEX idx_deps_child ON job_dependencies(child_job_id);
 CREATE INDEX idx_deps_parent ON job_dependencies(parent_job_id);
+
+-- 4. Transactional Outbox Table
+-- Written atomically with processed_jobs in CreateJob. The outbox relay reads
+-- undelivered rows and enqueues them to Redis, then marks them delivered.
+-- This guarantees no task is ever lost between DB write and Redis enqueue,
+-- even across server crashes.
+CREATE TABLE outbox (
+    id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    task_id     UUID NOT NULL REFERENCES processed_jobs(id) ON DELETE CASCADE,
+    queue_name  VARCHAR(255) NOT NULL,
+    delivered   BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    delivered_at TIMESTAMP WITH TIME ZONE
+);
+
+CREATE INDEX idx_outbox_undelivered ON outbox(delivered, created_at)
+    WHERE delivered = FALSE;

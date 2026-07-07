@@ -250,16 +250,46 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 	}
 }
 
-// ranProducer generates tasks at a fixed interval, creating a workflow and jobs in Postgres, then enqueuing them to Redis.
+// retryWithBackoff retries fn up to maxAttempts times with exponential backoff
+// (1s, 2s, 4s, ...). Respects ctx cancellation between attempts.
+func retryWithBackoff(ctx context.Context, maxAttempts int, fn func() error) error {
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err = fn()
+		if err == nil {
+			return nil
+		}
+		if attempt == maxAttempts-1 {
+			break
+		}
+		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		slog.Warn("retrying after backoff", "attempt", attempt+1, "maxAttempts", maxAttempts, "backoff", backoff, "error", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(backoff):
+		}
+	}
+	return err
+}
+
+// runProducer generates tasks at a fixed interval, creating a workflow and jobs in Postgres, then enqueuing them to Redis.
 // It simulates a task producer for demonstration purposes.
-func runProducer(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
+func runProducer(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("producer thread started, generating tasks...")
 
-	// Create one workflow for all demo tasks
-	workflowID, err := jobRepo.CreateWorkflow(ctx, "demo-workflow")
+	// Create one workflow for all demo tasks — retry with backoff if DB is down
+	var workflowID uuid.UUID
+	err := retryWithBackoff(ctx, 5, func() error {
+		return dbBreaker.Call(func() error {
+			var createErr error
+			workflowID, createErr = jobRepo.CreateWorkflow(ctx, "demo-workflow")
+			return createErr
+		})
+	})
 	if err != nil {
-		slog.Error("failed to create workflow, producer cannot start", "error", err)
+		slog.Error("failed to create workflow after retries, producer cannot start", "error", err)
 		return
 	}
 
@@ -282,25 +312,66 @@ func runProducer(ctx context.Context, queueName string, store *redis.RedisStore,
 				Payload:    json.RawMessage(`{}`),
 			}
 
-			// WAL: Write DB row FIRST
-			if err := jobRepo.CreateJob(ctx, queueName, task); err != nil {
-				slog.Error("failed to create job in DB, skipping", "taskId", taskID, "error", err)
+			// WAL: Write DB row + outbox row atomically — relay will enqueue to Redis
+			err := retryWithBackoff(ctx, 3, func() error {
+				return dbBreaker.Call(func() error {
+					return jobRepo.CreateJob(ctx, queueName, task)
+				})
+			})
+			if err != nil {
+				slog.Error("failed to create job in DB after retries, task dropped", "taskId", taskID, "error", err)
 				continue
 			}
 
-			// THEN enqueue to Redis
-			if err := store.EnqueueTask(ctx, queueName, taskID.String()); err != nil {
-				slog.Error("job created in DB but Redis enqueue failed - orphaned", "taskId", taskID, "error", err)
-				continue
-			}
-
-			slog.Info("task enqueued", "taskId", taskID, "counter", taskCounter)
+			slog.Info("task written to DB and outbox, relay will enqueue to Redis", "taskId", taskID, "counter", taskCounter)
 			taskCounter++
 		}
 	}
 }
 
-// ranJanitor periodically checks for tasks that have been inflight longer than holdTTL and moves them back to the main queue for retry.
+// runOutboxRelay polls the outbox table for undelivered rows and enqueues
+// each task to Redis, then marks the row delivered. Because the outbox row
+// is written in the same DB transaction as the processed_jobs row, this
+// guarantees at-least-once delivery to Redis even across server crashes.
+func runOutboxRelay(ctx context.Context, interval time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
+	defer wg.Done()
+	slog.Info("outbox relay started")
+
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("outbox relay received shutdown signal, exiting...")
+			return
+		case <-ticker.C:
+			entries, err := jobRepo.GetPendingOutbox(ctx)
+			if err != nil {
+				slog.Error("outbox relay failed to read pending entries", "error", err)
+				continue
+			}
+			if len(entries) == 0 {
+				continue
+			}
+
+			for _, entry := range entries {
+				if err := store.EnqueueTask(ctx, entry.QueueName, entry.TaskID.String()); err != nil {
+					slog.Error("outbox relay failed to enqueue task", "taskId", entry.TaskID, "error", err)
+					continue // leave outbox row undelivered, retry next tick
+				}
+				if err := jobRepo.MarkOutboxDelivered(ctx, entry.ID); err != nil {
+					slog.Error("outbox relay failed to mark row delivered, task may be double-enqueued on next tick", "outboxId", entry.ID, "taskId", entry.TaskID, "error", err)
+					continue
+				}
+				metrics.OutboxRelayed.WithLabelValues(entry.QueueName).Inc()
+				slog.Info("outbox relay delivered task to Redis", "taskId", entry.TaskID)
+			}
+		}
+	}
+}
+
+// runJanitor periodically checks for tasks that have been inflight longer than holdTTL and moves them back to the main queue for retry.
 func runJanitor(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("janitor thread started, monitoring for abandoned tasks...")
@@ -461,9 +532,10 @@ func main() {
 	}()
 
 	var wg sync.WaitGroup
-	wg.Add(6)
+	wg.Add(7)
 	go runWorker(ctx, cfg.Queue.Name, store, jobRepo, dbBreaker, &wg)
-	go runProducer(ctx, cfg.Queue.Name, store, jobRepo, &wg)
+	go runProducer(ctx, cfg.Queue.Name, store, jobRepo, dbBreaker, &wg)
+	go runOutboxRelay(ctx, 2*time.Second, store, jobRepo, &wg)
 	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, store, &wg)
 	go runDelayedPoller(ctx, cfg.Queue.Name, cfg.Queue.DelayedPollEvery, store, &wg)
 	go runDepthCollector(ctx, cfg.Queue.Name, cfg.Queue.DepthPollEvery, store, &wg)

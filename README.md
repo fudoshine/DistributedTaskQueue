@@ -116,6 +116,7 @@ store.EnqueueTask(ctx, queueName, upload.ID.String())
 - **Cascading Cancellation** — parent failure cancels all descendants
 - **Graceful Shutdown** — waits for in-flight tasks before exit
 - **Retry + DLQ** — exponential backoff, dead letter queue for permanent failures
+- **Orphan Recovery** — transactional outbox guarantees at-least-once delivery to Redis even across server crashes
 - **Prometheus Metrics** — all critical paths instrumented
 
 ---

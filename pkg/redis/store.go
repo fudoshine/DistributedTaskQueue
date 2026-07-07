@@ -254,6 +254,43 @@ func (s *RedisStore) MoveToDeadLetterQueue(ctx context.Context, queueName, taskI
 	return nil
 }
 
+// IsTaskQueued returns true if the task is present in the main queue,
+// inflight list, or delayed set. Used by the orphan reconciler to check
+// whether a PENDING DB row already has a corresponding Redis presence.
+func (s *RedisStore) IsTaskQueued(ctx context.Context, queueName, taskID string) (bool, error) {
+	inflightKey := queueName + ":inflight"
+	delayedKey := queueName + ":delayed"
+
+	// Check main queue
+	pos, err := s.rdb.LPos(ctx, queueName, taskID, redis.LPosArgs{}).Result()
+	if err != nil && err != redis.Nil {
+		return false, fmt.Errorf("failed to check main queue for task %s: %w", taskID, err)
+	}
+	if err == nil && pos >= 0 {
+		return true, nil
+	}
+
+	// Check inflight
+	pos, err = s.rdb.LPos(ctx, inflightKey, taskID, redis.LPosArgs{}).Result()
+	if err != nil && err != redis.Nil {
+		return false, fmt.Errorf("failed to check inflight queue for task %s: %w", taskID, err)
+	}
+	if err == nil && pos >= 0 {
+		return true, nil
+	}
+
+	// Check delayed set
+	_, err = s.rdb.ZScore(ctx, delayedKey, taskID).Result()
+	if err != nil && err != redis.Nil {
+		return false, fmt.Errorf("failed to check delayed set for task %s: %w", taskID, err)
+	}
+	if err == nil {
+		return true, nil
+	}
+
+	return false, nil
+}
+
 // CollectDepths reads the current size of each queue-related Redis
 // structure and updates the corresponding Prometheus gauges. Intended to be
 // called periodically (e.g. every few seconds) by a dedicated goroutine —

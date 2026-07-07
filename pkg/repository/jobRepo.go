@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -121,6 +122,19 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 				metrics.JobRepoErrors.WithLabelValues(queueName, "CreateJob").Inc()
 				return fmt.Errorf("failed to create dependency %s -> %s: %w", parentID, task.ID, err)
 			}
+		}
+	} else {
+		// Root task (no parents) — write outbox row in the same transaction.
+		// The outbox relay will enqueue this to Redis. This guarantees atomicity:
+		// either both processed_jobs and outbox land, or neither does.
+		outboxQuery := `
+			INSERT INTO outbox (task_id, queue_name, delivered)
+			VALUES ($1, $2, FALSE);
+		`
+		_, err = tx.Exec(ctx, outboxQuery, task.ID, queueName)
+		if err != nil {
+			metrics.JobRepoErrors.WithLabelValues(queueName, "CreateJob").Inc()
+			return fmt.Errorf("failed to write outbox row for task %s: %w", task.ID, err)
 		}
 	}
 
@@ -435,6 +449,82 @@ func (r *JobRepository) UpdateWorkflowStatus(ctx context.Context, workflowID uui
 		}
 	}
 	return nil
+}
+
+// OutboxEntry represents a single undelivered row from the outbox table.
+type OutboxEntry struct {
+	ID        uuid.UUID
+	TaskID    uuid.UUID
+	QueueName string
+}
+
+// GetPendingOutbox returns all undelivered outbox rows ordered by creation time.
+// The relay calls this on every tick and enqueues each task to Redis.
+func (r *JobRepository) GetPendingOutbox(ctx context.Context) ([]OutboxEntry, error) {
+	query := `
+		SELECT id, task_id, queue_name
+		FROM outbox
+		WHERE delivered = FALSE
+		ORDER BY created_at ASC;
+	`
+	rows, err := r.pool.Query(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query pending outbox: %w", err)
+	}
+	defer rows.Close()
+
+	var entries []OutboxEntry
+	for rows.Next() {
+		var e OutboxEntry
+		if err := rows.Scan(&e.ID, &e.TaskID, &e.QueueName); err != nil {
+			return nil, fmt.Errorf("failed to scan outbox row: %w", err)
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
+// MarkOutboxDelivered marks an outbox row as delivered after the task has been
+// successfully enqueued to Redis. Called by the outbox relay.
+func (r *JobRepository) MarkOutboxDelivered(ctx context.Context, outboxID uuid.UUID) error {
+	query := `
+		UPDATE outbox
+		SET delivered = TRUE,
+		    delivered_at = NOW()
+		WHERE id = $1;
+	`
+	_, err := r.pool.Exec(ctx, query, outboxID)
+	if err != nil {
+		return fmt.Errorf("failed to mark outbox row %s as delivered: %w", outboxID, err)
+	}
+	return nil
+}
+
+// GetStuckPendingJobs returns task IDs that have been sitting in PENDING status
+// for longer than the given threshold. These are candidates for the orphan
+// reconciler — they exist in the DB but were never enqueued to Redis (e.g.
+// because EnqueueTask failed after CreateJob succeeded).
+func (r *JobRepository) GetStuckPendingJobs(ctx context.Context, olderThan time.Duration) ([]string, error) {
+	query := `
+		SELECT id FROM processed_jobs
+		WHERE status = $1
+		  AND created_at < NOW() - ($2 || ' seconds')::INTERVAL;
+	`
+	rows, err := r.pool.Query(ctx, query, StatusPending, int(olderThan.Seconds()))
+	if err != nil {
+		return nil, fmt.Errorf("failed to query stuck pending jobs: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("failed to scan pending job id: %w", err)
+		}
+		ids = append(ids, id.String())
+	}
+	return ids, rows.Err()
 }
 
 // GetWorkflowID retrieves the workflow_id for a given task.
