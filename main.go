@@ -512,6 +512,15 @@ func main() {
 	}
 
 	pgCfg := repository.PostgresConfig{ConnString: cfg.Postgres.ConnString}
+
+	// Run migrations before opening the pool — if migrations fail, don't start
+	slog.Info("running database migrations...")
+	if err := repository.RunMigrations(cfg.Postgres.ConnString, "file://db/migrations"); err != nil {
+		slog.Error("database migration failed, cannot start", "error", err)
+		store.Close()
+		return
+	}
+
 	pgPool, err := repository.NewPostgresPool(ctx, pgCfg)
 	if err != nil {
 		slog.Error("failed to initialize PostgreSQL connection pool", "error", err)

@@ -12,7 +12,7 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /app
 COPY --from=builder /app/distributed-queue .
-COPY db/schema.sql ./db/
+COPY db/migrations ./db/migrations
 
 EXPOSE 9090
 CMD ["./distributed-queue"]
