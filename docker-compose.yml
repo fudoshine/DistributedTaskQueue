@@ -1,0 +1,95 @@
+version: "3.9"
+
+services:
+  postgres:
+    image: postgres:14-alpine
+    container_name: queue-postgres
+    environment:
+      POSTGRES_DB: task_queue
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db/schema.sql:/docker-entrypoint-initdb.d/schema.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: queue-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  app:
+    build: .
+    container_name: queue-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_ADDRESS: "redis:6379"
+      REDIS_PASSWORD: ""
+      REDIS_DB: "0"
+      POSTGRES_CONN_STRING: "postgres://postgres:password@postgres:5432/task_queue?sslmode=disable"
+      METRICS_ADDR: ":9090"
+      QUEUE_NAME: "queue:video_processing"
+      WORKER_COUNT: "5"
+      MAX_RETRIES: "3"
+      HOLD_TTL: "20s"
+      JANITOR_INTERVAL: "5s"
+      DELAYED_POLL_INTERVAL: "2s"
+      DEPTH_POLL_INTERVAL: "5s"
+      TASK_PRODUCER_INTERVAL: "1s"
+      SHUTDOWN_TIMEOUT: "30s"
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:v2.55.0
+    container_name: queue-prometheus
+    volumes:
+      - ./deploy/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9091:9090"
+    depends_on:
+      - app
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: queue-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+    volumes:
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+
+volumes:
+  postgres-data:
+  redis-data:
+  prometheus-data:
+  grafana-data:

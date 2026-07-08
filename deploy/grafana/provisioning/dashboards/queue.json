@@ -1,0 +1,123 @@
+{
+  "title": "Distributed Queue",
+  "uid": "distributed-queue",
+  "version": 1,
+  "schemaVersion": 36,
+  "refresh": "10s",
+  "panels": [
+    {
+      "title": "Queue Depth",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "queue_depth",
+          "legendFormat": "main"
+        },
+        {
+          "expr": "queue_inflight_depth",
+          "legendFormat": "inflight"
+        },
+        {
+          "expr": "queue_delayed_depth",
+          "legendFormat": "delayed"
+        },
+        {
+          "expr": "queue_dlq_depth",
+          "legendFormat": "dlq"
+        }
+      ]
+    },
+    {
+      "title": "Task Throughput",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(queue_tasks_enqueued_total[1m])",
+          "legendFormat": "enqueued/s"
+        },
+        {
+          "expr": "rate(queue_tasks_acknowledged_total[1m])",
+          "legendFormat": "completed/s"
+        },
+        {
+          "expr": "rate(queue_tasks_retried_total[1m])",
+          "legendFormat": "retried/s"
+        }
+      ]
+    },
+    {
+      "title": "Processing Duration (p50 / p95 / p99)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, rate(queue_processing_duration_seconds_bucket[5m]))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, rate(queue_processing_duration_seconds_bucket[5m]))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, rate(queue_processing_duration_seconds_bucket[5m]))",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "title": "Failures & DLQ",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 8, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(queue_processing_failures_total[1m])",
+          "legendFormat": "failures/s"
+        },
+        {
+          "expr": "rate(queue_tasks_dead_lettered_total[1m])",
+          "legendFormat": "dead-lettered/s"
+        },
+        {
+          "expr": "rate(queue_tasks_swept_total[1m])",
+          "legendFormat": "swept/s"
+        }
+      ]
+    },
+    {
+      "title": "Workflow Status",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(queue_workflows_created_total[1m])",
+          "legendFormat": "created/s"
+        },
+        {
+          "expr": "rate(queue_workflows_completed_total[1m])",
+          "legendFormat": "completed/s"
+        },
+        {
+          "expr": "rate(queue_workflows_failed_total[1m])",
+          "legendFormat": "failed/s"
+        }
+      ]
+    },
+    {
+      "title": "Outbox & Orphans",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 16, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(queue_outbox_relayed_total[1m])",
+          "legendFormat": "outbox relayed/s"
+        },
+        {
+          "expr": "rate(queue_tasks_cancelled_cascade_total[1m])",
+          "legendFormat": "cascade cancelled/s"
+        }
+      ]
+    }
+  ]
+}
