@@ -9,6 +9,7 @@ import (
 	"distributed-queue/pkg/repository"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"math/rand"
 	"net/http"
@@ -274,28 +275,21 @@ func retryWithBackoff(ctx context.Context, maxAttempts int, fn func() error) err
 }
 
 // runProducer generates tasks at a fixed interval, creating a workflow and jobs in Postgres, then enqueuing them to Redis.
-// It simulates a task producer for demonstration purposes.
-func runProducer(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
+// runProducer creates a new 3-step DAG pipeline on every tick:
+//
+//	Upload → Transcode → Notify
+//
+// Each pipeline is its own workflow. Only the root task (Upload) is written
+// to the outbox — the worker automatically enqueues Transcode once Upload
+// completes, and Notify once Transcode completes.
+func runProducer(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
 	defer wg.Done()
-	slog.Info("producer thread started, generating tasks...")
+	slog.Info("producer thread started, generating DAG pipelines...")
 
-	// Create one workflow for all demo tasks — retry with backoff if DB is down
-	var workflowID uuid.UUID
-	err := retryWithBackoff(ctx, 5, func() error {
-		return dbBreaker.Call(func() error {
-			var createErr error
-			workflowID, createErr = jobRepo.CreateWorkflow(ctx, "demo-workflow")
-			return createErr
-		})
-	})
-	if err != nil {
-		slog.Error("failed to create workflow after retries, producer cannot start", "error", err)
-		return
-	}
-
-	taskCounter := 1
-	ticker := time.NewTicker(1 * time.Second)
+	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+
+	pipelineCounter := 1
 
 	for {
 		select {
@@ -303,28 +297,72 @@ func runProducer(ctx context.Context, queueName string, store *redis.RedisStore,
 			slog.Info("producer thread received shutdown signal, exiting...")
 			return
 		case <-ticker.C:
-			taskID := uuid.New()
-			task := repository.Task{
-				ID:         taskID,
-				WorkflowID: workflowID,
-				ParentIDs:  []uuid.UUID{},
-				TaskType:   "VIDEO_PROCESS",
-				Payload:    json.RawMessage(`{}`),
-			}
-
-			// WAL: Write DB row + outbox row atomically — relay will enqueue to Redis
-			err := retryWithBackoff(ctx, 3, func() error {
+			// Each tick creates one complete workflow: Upload → Transcode → Notify
+			var workflowID uuid.UUID
+			err := retryWithBackoff(ctx, 5, func() error {
 				return dbBreaker.Call(func() error {
-					return jobRepo.CreateJob(ctx, queueName, task)
+					var createErr error
+					workflowID, createErr = jobRepo.CreateWorkflow(ctx, fmt.Sprintf("video-pipeline-%d", pipelineCounter))
+					return createErr
 				})
 			})
 			if err != nil {
-				slog.Error("failed to create job in DB after retries, task dropped", "taskId", taskID, "error", err)
+				slog.Error("failed to create workflow, skipping pipeline", "pipeline", pipelineCounter, "error", err)
 				continue
 			}
 
-			slog.Info("task written to DB and outbox, relay will enqueue to Redis", "taskId", taskID, "counter", taskCounter)
-			taskCounter++
+			uploadID := uuid.New()
+			transcodeID := uuid.New()
+			notifyID := uuid.New()
+
+			pipeline := []repository.Task{
+				{
+					ID:         uploadID,
+					WorkflowID: workflowID,
+					ParentIDs:  []uuid.UUID{},            // root — goes to outbox
+					TaskType:   "VIDEO_UPLOAD",
+					Payload:    json.RawMessage(`{"file":"video.mp4"}`),
+				},
+				{
+					ID:         transcodeID,
+					WorkflowID: workflowID,
+					ParentIDs:  []uuid.UUID{uploadID},    // waits for upload
+					TaskType:   "VIDEO_TRANSCODE",
+					Payload:    json.RawMessage(`{"resolution":"1080p"}`),
+				},
+				{
+					ID:         notifyID,
+					WorkflowID: workflowID,
+					ParentIDs:  []uuid.UUID{transcodeID}, // waits for transcode
+					TaskType:   "VIDEO_NOTIFY",
+					Payload:    json.RawMessage(`{"channel":"email"}`),
+				},
+			}
+
+			// Write all 3 tasks to DB atomically — only root goes to outbox
+			allCreated := true
+			for _, task := range pipeline {
+				t := task // capture
+				err := retryWithBackoff(ctx, 3, func() error {
+					return dbBreaker.Call(func() error {
+						return jobRepo.CreateJob(ctx, queueName, t)
+					})
+				})
+				if err != nil {
+					slog.Error("failed to create task in pipeline, skipping workflow", "taskType", t.TaskType, "workflowId", workflowID, "error", err)
+					allCreated = false
+					break
+				}
+			}
+
+			if allCreated {
+				slog.Info("pipeline created, relay will enqueue upload task",
+					"pipeline", pipelineCounter,
+					"workflowId", workflowID,
+					"tasks", []string{"VIDEO_UPLOAD", "VIDEO_TRANSCODE", "VIDEO_NOTIFY"},
+				)
+				pipelineCounter++
+			}
 		}
 	}
 }
@@ -543,7 +581,7 @@ func main() {
 	var wg sync.WaitGroup
 	wg.Add(7)
 	go runWorker(ctx, cfg.Queue.Name, store, jobRepo, dbBreaker, &wg)
-	go runProducer(ctx, cfg.Queue.Name, store, jobRepo, dbBreaker, &wg)
+	go runProducer(ctx, cfg.Queue.Name, cfg.Queue.TaskProducerInterval, store, jobRepo, dbBreaker, &wg)
 	go runOutboxRelay(ctx, 2*time.Second, store, jobRepo, &wg)
 	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, store, &wg)
 	go runDelayedPoller(ctx, cfg.Queue.Name, cfg.Queue.DelayedPollEvery, store, &wg)
