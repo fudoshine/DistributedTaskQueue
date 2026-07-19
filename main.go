@@ -74,13 +74,13 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 		var status string
 		var tryErr error
-		
+
 		// Use circuit breaker for DB call
 		cbErr1 := dbBreaker.Call(func() error {
 			status, tryErr = jobRepo.TryStartJob(ctx, queueName, taskId)
 			return tryErr
 		})
-		
+
 		if cbErr1 != nil {
 			if errors.Is(cbErr1, circuitbreaker.ErrCircuitOpen) {
 				slog.Warn("circuit breaker open, skipping DB call", "taskId", taskId)
@@ -90,7 +90,7 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 			}
 			tryErr = cbErr1
 		}
-		
+
 		if tryErr != nil {
 			if errors.Is(tryErr, repository.ErrDuplicateJob) {
 				slog.Warn("[IDEMPOTENCY] task already completed, dropping from Redis", "taskId", taskId)
@@ -120,74 +120,51 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 		processingStart := time.Now()
 		procErr := simulateProcessing(ctx, taskId)
 		metrics.ProcessingDuration.WithLabelValues(queueName).Observe(time.Since(processingStart).Seconds())
-
 		if procErr == nil {
-			slog.Info("task processing completed, preparing to complete", "taskId", taskId)
+			slog.Info("task processed successfully, completing and scheduling children", "taskId", taskId)
 
-			// STEP 1: Check for ready children FIRST (before marking parent complete)
-			children, err := jobRepo.CheckAndEnqueueChildren(ctx, queueName, taskId)
-			if err != nil {
-				slog.Error("failed to check for ready children", "taskId", taskId, "error", err)
-				// Don't complete parent if we can't check children - leave for janitor
-				continue
-			}
-
-			// STEP 2: Enqueue children to Redis BEFORE marking parent complete
-			if len(children) > 0 {
-				slog.Info("enqueuing ready children before marking parent complete", "parentTask", taskId, "childCount", len(children))
-				allEnqueued := true
-				for _, childID := range children {
-					if err := store.EnqueueTask(ctx, queueName, childID); err != nil {
-						slog.Error("failed to enqueue child task", "childId", childID, "error", err)
-						metrics.ChildEnqueueFailures.WithLabelValues(queueName).Inc()
-						allEnqueued = false
-					} else {
-						metrics.ChildrenEnqueued.WithLabelValues(queueName).Inc()
-					}
-				}
-				// If ANY child enqueue failed, don't complete parent - let janitor retry
-				if !allEnqueued {
-					slog.Error("failed to enqueue all children, leaving parent for janitor to retry", "taskId", taskId)
-					continue
-				}
-			}
-
-			// STEP 3: NOW mark parent as complete (after children are in Redis)
+			var (
+				children []string
+				dbErr    error
+			)
 			cbErr3 := dbBreaker.Call(func() error {
-				return jobRepo.CompleteJob(ctx, queueName, taskId)
+				children, dbErr = jobRepo.CompleteJobAndScheduleChildren(ctx, queueName, taskId)
+				return dbErr
 			})
-			
+
 			if cbErr3 != nil {
 				if errors.Is(cbErr3, circuitbreaker.ErrCircuitOpen) {
-					slog.Warn("circuit breaker open for DB, cannot complete job", "taskId", taskId)
+					slog.Warn("circuit breaker open for DB, skipping completion record", "taskId", taskId)
+					// Leave task in inflight, janitor will recover
 					time.Sleep(time.Second)
 					continue
 				}
-				slog.Error("failed to write job completion to postgres, leaving for janitor to recover", "taskId", taskId, "error", cbErr3)
-				continue
+				dbErr = cbErr3
 			}
 
-			// STEP 4: Update workflow status
+			if dbErr != nil {
+				slog.Error("failed to complete task and schedule children, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
+				// Exponential backoff to avoid hammering DB when it's down
+				backoff := time.Duration(rand.Intn(1000)) * time.Millisecond
+				time.Sleep(backoff)
+				continue
+			}
+			if len(children) > 0 {
+				slog.Info("scheduled ready children through outbox", "parentTask", taskId, "childCount", len(children))
+			}
+
 			workflowID, err := jobRepo.GetWorkflowID(ctx, taskId)
 			if err != nil {
 				slog.Error("failed to get workflow_id for status update", "taskId", taskId, "error", err)
-			} else {
-				if err := jobRepo.UpdateWorkflowStatus(ctx, workflowID); err != nil {
-					slog.Error("failed to update workflow status", "workflowId", workflowID, "error", err)
-				}
+			} else if err := jobRepo.UpdateWorkflowStatus(ctx, workflowID); err != nil {
+				slog.Error("failed to update workflow status", "workflowId", workflowID, "error", err)
 			}
 
 			if err := store.AcknowledgeTask(ctx, queueName, taskId); err != nil {
-				slog.Error("failed to acknowledge task, will be recovered by janitor", "taskId", taskId, "error", err)
-				// Exponential backoff with jitter to avoid hammering Redis
-				backoff := 500*time.Millisecond + time.Duration(rand.Intn(500))*time.Millisecond
-				time.Sleep(backoff)
-			} else {
-				slog.Info("task acknowledged and synchronized everywhere", "taskId", taskId)
+				slog.Error("failed to acknowledge task in Redis, leaving for janitor to recover", "taskId", taskId, "error", err)
 			}
 			continue
 		}
-
 		// Processing failed. Decide retry vs dead-letter using the DB's
 		// per-job retry counter as the source of truth.
 		metrics.ProcessingFailures.WithLabelValues(queueName).Inc()
@@ -195,13 +172,13 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 		var currentRetry, maxRetry int
 		var dbErr error
-		
+
 		// Use circuit breaker for DB call
 		cbErr2 := dbBreaker.Call(func() error {
 			currentRetry, maxRetry, dbErr = jobRepo.RecordFailure(ctx, queueName, taskId, procErr.Error())
 			return dbErr
 		})
-		
+
 		if cbErr2 != nil {
 			if errors.Is(cbErr2, circuitbreaker.ErrCircuitOpen) {
 				slog.Warn("circuit breaker open for DB, skipping failure record", "taskId", taskId)
@@ -211,7 +188,7 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 			}
 			dbErr = cbErr2
 		}
-		
+
 		if dbErr != nil {
 			slog.Error("failed to record failure in postgres, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
 			// Exponential backoff to avoid hammering DB when it's down
@@ -263,7 +240,7 @@ func retryWithBackoff(ctx context.Context, maxAttempts int, fn func() error) err
 		if attempt == maxAttempts-1 {
 			break
 		}
-		backoff := time.Duration(1<<uint(attempt)) * time.Second
+		backoff := time.Duration(1<<uint(attempt))*time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
 		slog.Warn("retrying after backoff", "attempt", attempt+1, "maxAttempts", maxAttempts, "backoff", backoff, "error", err)
 		select {
 		case <-ctx.Done():
@@ -319,14 +296,14 @@ func runProducer(ctx context.Context, queueName string, interval time.Duration, 
 				{
 					ID:         uploadID,
 					WorkflowID: workflowID,
-					ParentIDs:  []uuid.UUID{},            // root — goes to outbox
+					ParentIDs:  []uuid.UUID{}, // root — goes to outbox
 					TaskType:   "VIDEO_UPLOAD",
 					Payload:    json.RawMessage(`{"file":"video.mp4"}`),
 				},
 				{
 					ID:         transcodeID,
 					WorkflowID: workflowID,
-					ParentIDs:  []uuid.UUID{uploadID},    // waits for upload
+					ParentIDs:  []uuid.UUID{uploadID}, // waits for upload
 					TaskType:   "VIDEO_TRANSCODE",
 					Payload:    json.RawMessage(`{"resolution":"1080p"}`),
 				},
@@ -482,14 +459,14 @@ func runMetricsServer(ctx context.Context, metricsAddr string, wg *sync.WaitGrou
 
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	
+
 	// Health check endpoint for load balancers
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"healthy","service":"distributed-queue"}`))
 	})
-	
+
 	srv := &http.Server{Addr: metricsAddr, Handler: mux}
 
 	serverErr := make(chan error, 1)
@@ -538,7 +515,7 @@ func main() {
 		if err == nil {
 			break
 		}
-		
+
 		if i < maxRetries-1 {
 			backoff := time.Duration(1<<uint(i)) * time.Second
 			slog.Warn("failed to connect to Redis, retrying...", "attempt", i+1, "backoff", backoff, "error", err)
@@ -590,15 +567,15 @@ func main() {
 
 	<-ctx.Done()
 	slog.Info("shutdown signal received, waiting for all threads to exit...")
-	
+
 	// Graceful shutdown with timeout
 	done := make(chan struct{})
-	
+
 	go func() {
 		wg.Wait()
 		close(done)
 	}()
-	
+
 	select {
 	case <-done:
 		slog.Info("all threads exited gracefully")

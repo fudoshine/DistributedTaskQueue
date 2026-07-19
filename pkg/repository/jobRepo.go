@@ -15,8 +15,7 @@ import (
 )
 
 var (
-	ErrDuplicateJob    = errors.New("job execution skipped: already completed")
-	ErrJobAlreadyOwned = errors.New("job execution skipped: another worker already owns this job")
+	ErrDuplicateJob = errors.New("job execution skipped: already completed")
 	// ErrJobNotFound means TryStartJob was called for a taskID with no
 	// corresponding processed_jobs row. Under this system's design that
 	// should never happen — every task is created in Postgres via CreateJob
@@ -147,28 +146,9 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 }
 
 // TryStartJob implements the idempotency/ownership layer for job execution.
-//
-// Unlike an earlier version of this method, this is now UPDATE-only — it
-// does not create rows. Every task's processed_jobs row is created up front
-// by CreateJob, before the task's ID is ever pushed onto Redis, so by the
-// time a worker calls TryStartJob the row is guaranteed to exist. If it
-// doesn't, that's a real bug elsewhere (an ID reached Redis without going
-// through CreateJob) and is surfaced as ErrJobNotFound rather than silently
-// fabricated, which is what the old INSERT ... ON CONFLICT version did
-// (and which broke the workflow_id / task_type / task_details columns by
-// filling them with placeholder garbage).
-//
-// Three outcomes for a given taskID's existing row:
-//  1. status == COMPLETED -> returns ErrDuplicateJob; caller should drop the task.
-//  2. status == PENDING or RUNNING (the common case: fresh task, or one
-//     abandoned by a crashed worker and swept back onto the queue by the
-//     janitor) -> claimed and moved to RUNNING. Returns (RUNNING, nil).
-//  3. no row exists -> returns ErrJobNotFound.
-//
-// As before, this does not distinguish "abandoned, safe to resume" from
-// "actively owned by another worker right now" — see ErrJobAlreadyOwned's
-// doc comment for why that's acceptable under this system's current claim
-// model (Redis BLMOVE is the sole claim authority).
+// Redis is the claim authority: a task reclaimed by the janitor may already be
+// RUNNING in Postgres and is allowed to resume. COMPLETED jobs are never run
+// again; a missing row is treated as a data inconsistency.
 func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID string) (string, error) {
 	id, err := uuid.Parse(taskID)
 	if err != nil {
@@ -219,32 +199,6 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID strin
 	return currentStatus, nil
 }
 
-func (r *JobRepository) CompleteJob(ctx context.Context, queueName, taskID string) error {
-	id, err := uuid.Parse(taskID)
-	if err != nil {
-		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJob").Inc()
-		return fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
-	}
-
-	query := `
-		UPDATE processed_jobs
-		SET status = $2,
-		    processed_at = NOW()
-		WHERE id = $1;
-	`
-	tag, err := r.pool.Exec(ctx, query, id, StatusCompleted)
-	if err != nil {
-		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJob").Inc()
-		return fmt.Errorf("failed to mark job as completed: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJob").Inc()
-		return fmt.Errorf("failed to mark job as completed: %w: %s", ErrJobNotFound, taskID)
-	}
-	metrics.JobsCompleted.WithLabelValues(queueName).Inc()
-	return nil
-}
-
 // RecordFailure increments the retry counter and stores the latest error,
 // transitioning status to FAILED once max_retries is reached. Returns the
 // updated (currentRetries, maxRetries) so the caller can decide retry vs DLQ.
@@ -277,47 +231,105 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID, er
 	return currentRetries, maxRetries, nil
 }
 
-// CheckAndEnqueueChildren checks if all parents of potential children are
-// COMPLETED, and if so, returns a list of child task IDs ready to be enqueued.
-// Call this after successfully completing a job to trigger dependent tasks.
-func (r *JobRepository) CheckAndEnqueueChildren(ctx context.Context, queueName, completedTaskID string) ([]string, error) {
-	id, err := uuid.Parse(completedTaskID)
+// CompleteJobAndScheduleChildren durably completes a job and promotes every
+// newly-ready child to QUEUED in the same PostgreSQL transaction. Each
+// promoted child receives an outbox entry, so Redis publication is retried by
+// the outbox relay instead of being coupled to a worker's process lifetime.
+//
+// Completion for a workflow is serialized with a transaction advisory lock.
+// This matters for a multi-parent child: two parents may finish concurrently;
+// without serialization each transaction could observe the other as RUNNING
+// and neither would promote the child.
+func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queueName, taskID string) ([]string, error) {
+	id, err := uuid.Parse(taskID)
 	if err != nil {
-		return nil, fmt.Errorf("taskID %q is not a valid UUID: %w", completedTaskID, err)
+		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+		return nil, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
 	}
 
-	// Find all children of this task where ALL parents are COMPLETED
-	query := `
-		SELECT DISTINCT jd.child_job_id
-		FROM job_dependencies jd
-		WHERE jd.parent_job_id = $1
-		  AND NOT EXISTS (
-			  -- Child is ready only if ALL its parents are COMPLETED
-			  SELECT 1
-			  FROM job_dependencies jd2
-			  INNER JOIN processed_jobs pj ON jd2.parent_job_id = pj.id
-			  WHERE jd2.child_job_id = jd.child_job_id
-			    AND pj.status != $2
-		  );
-	`
-
-	rows, err := r.pool.Query(ctx, query, id, StatusCompleted)
+	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		metrics.JobRepoErrors.WithLabelValues(queueName, "CheckAndEnqueueChildren").Inc()
-		return nil, fmt.Errorf("failed to query ready children: %w", err)
+		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+		return nil, fmt.Errorf("failed to begin completion transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	var workflowID uuid.UUID
+	err = tx.QueryRow(ctx, `
+		UPDATE processed_jobs
+		SET status = $2, processed_at = NOW()
+		WHERE id = $1 AND status = $3
+		RETURNING workflow_id;
+	`, id, StatusCompleted, StatusRunning).Scan(&workflowID)
+	if err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("cannot complete job %s: job is missing or not RUNNING", taskID)
+		}
+		return nil, fmt.Errorf("failed to complete job %s: %w", taskID, err)
+	}
+
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));`, workflowID); err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+		return nil, fmt.Errorf("failed to lock workflow %s for completion: %w", workflowID, err)
+	}
+
+	rows, err := tx.Query(ctx, `
+		WITH ready_children AS (
+			SELECT DISTINCT child.id
+			FROM job_dependencies edge
+			JOIN processed_jobs child ON child.id = edge.child_job_id
+			WHERE edge.parent_job_id = $1
+			  AND child.status = $2
+			  AND NOT EXISTS (
+				SELECT 1
+				FROM job_dependencies parent_edge
+				JOIN processed_jobs parent ON parent.id = parent_edge.parent_job_id
+				WHERE parent_edge.child_job_id = child.id
+				  AND parent.status <> $3
+			  )
+		), promoted_children AS (
+			UPDATE processed_jobs child
+			SET status = $4
+			FROM ready_children ready
+			WHERE child.id = ready.id AND child.status = $2
+			RETURNING child.id
+		)
+		INSERT INTO outbox (task_id, queue_name, delivered)
+		SELECT id, $5, FALSE FROM promoted_children
+		ON CONFLICT (task_id) DO NOTHING
+		RETURNING task_id;
+	`, id, StatusPending, StatusCompleted, StatusQueued, queueName)
+	if err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+		return nil, fmt.Errorf("failed to schedule children of job %s: %w", taskID, err)
 	}
 	defer rows.Close()
 
-	var readyChildren []string
+	children := make([]string, 0)
 	for rows.Next() {
 		var childID uuid.UUID
 		if err := rows.Scan(&childID); err != nil {
-			return nil, fmt.Errorf("failed to scan child ID: %w", err)
+			metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+			return nil, fmt.Errorf("failed to scan scheduled child of job %s: %w", taskID, err)
 		}
-		readyChildren = append(readyChildren, childID.String())
+		children = append(children, childID.String())
+	}
+	if err := rows.Err(); err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+		return nil, fmt.Errorf("failed to schedule children of job %s: %w", taskID, err)
 	}
 
-	return readyChildren, rows.Err()
+	if err := tx.Commit(ctx); err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
+		return nil, fmt.Errorf("failed to commit completion of job %s: %w", taskID, err)
+	}
+
+	metrics.JobsCompleted.WithLabelValues(queueName).Inc()
+	if len(children) > 0 {
+		metrics.ChildrenEnqueued.WithLabelValues(queueName).Add(float64(len(children)))
+	}
+	return children, nil
 }
 
 // MarkAsCancelledCascading recursively cancels all descendant tasks when a

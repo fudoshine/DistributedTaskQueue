@@ -131,11 +131,12 @@ var (
 
 	// --- DAG orchestration metrics
 
-	// ChildrenEnqueued counts how many child tasks were triggered when a
-	// parent completed. This shows DAG fan-out activity.
+	// ChildrenEnqueued counts dependent children promoted to QUEUED when a
+	// parent completed. Redis delivery is performed asynchronously by the
+	// transactional outbox relay.
 	ChildrenEnqueued = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "queue_children_enqueued_total",
-		Help: "Total child tasks enqueued after parent completion (DAG orchestration).",
+		Help: "Total dependent child tasks scheduled after parent completion (DAG orchestration).",
 	}, []string{"queue"})
 
 	// ChildEnqueueFailures counts failures to enqueue ready children. This
