@@ -92,11 +92,13 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 		}
 
 		if tryErr != nil {
-			if errors.Is(tryErr, repository.ErrDuplicateJob) {
-				slog.Warn("[IDEMPOTENCY] task already completed, dropping from Redis", "taskId", taskId)
+			if errors.Is(tryErr, repository.ErrDuplicateJob) ||
+				errors.Is(tryErr, repository.ErrTerminalJob) ||
+				errors.Is(tryErr, repository.ErrJobNotReady) {
+				slog.Warn("task is not executable, dropping stale Redis message", "taskId", taskId, "error", tryErr)
 				metrics.TasksAcknowledged.WithLabelValues(queueName).Inc()
 				if err := store.AcknowledgeTask(ctx, queueName, taskId); err != nil {
-					slog.Error("failed to clean up duplicate task from Redis", "taskId", taskId, "error", err)
+					slog.Error("failed to remove stale task from Redis", "taskId", taskId, "error", err)
 				}
 				continue
 			}
@@ -106,6 +108,13 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 				if err := store.MoveToDeadLetterQueue(ctx, queueName, taskId); err != nil {
 					slog.Error("failed to move orphaned task to DLQ", "taskId", taskId, "error", err)
 				}
+				continue
+			}
+			if errors.Is(tryErr, repository.ErrJobAlreadyOwned) {
+				// A concurrent worker still owns the durable RUNNING state. Leave
+				// this Redis copy in inflight; the janitor will reclaim it only if
+				// that worker fails to finish before the visibility timeout.
+				slog.Warn("task is already owned by another worker, leaving for janitor", "taskId", taskId)
 				continue
 			}
 			// Any other error (DB down, timeout, etc): task stays claimed in
@@ -387,7 +396,7 @@ func runOutboxRelay(ctx context.Context, interval time.Duration, store *redis.Re
 }
 
 // runJanitor periodically checks for tasks that have been inflight longer than holdTTL and moves them back to the main queue for retry.
-func runJanitor(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
+func runJanitor(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("janitor thread started, monitoring for abandoned tasks...")
 
@@ -400,11 +409,34 @@ func runJanitor(ctx context.Context, queueName string, interval time.Duration, s
 			slog.Info("janitor thread received shutdown signal, exiting...")
 			return
 		case <-ticker.C:
-			if err := store.SweepAbondonedTasks(ctx, queueName); err != nil {
+			reclaimed, err := store.FindAbandonedTasks(ctx, queueName)
+			if err != nil {
 				slog.Error("failed to sweep abandoned tasks", "error", err)
-			} else {
-				slog.Info("janitor sweep completed")
+				continue
 			}
+			for _, taskID := range reclaimed {
+				requeued, err := jobRepo.RequeueAbandonedJob(ctx, queueName, taskID)
+				if err != nil {
+					slog.Error("failed to return abandoned job to queued state", "taskId", taskID, "error", err)
+					continue
+				}
+				if !requeued {
+					slog.Info("abandoned Redis entry belongs to a terminal or missing job, acknowledging it", "taskId", taskID)
+					if err := store.AcknowledgeTask(ctx, queueName, taskID); err != nil {
+						slog.Error("failed to remove terminal abandoned task from Redis", "taskId", taskID, "error", err)
+					}
+					continue
+				}
+				moved, err := store.RequeueAbandonedTask(ctx, queueName, taskID)
+				if err != nil {
+					slog.Error("failed to requeue abandoned Redis task", "taskId", taskID, "error", err)
+					continue
+				}
+				if !moved {
+					slog.Info("abandoned task was already removed from Redis inflight", "taskId", taskID)
+				}
+			}
+			slog.Info("janitor sweep completed", "reclaimed", len(reclaimed))
 		}
 	}
 }
@@ -560,7 +592,7 @@ func main() {
 	go runWorker(ctx, cfg.Queue.Name, store, jobRepo, dbBreaker, &wg)
 	go runProducer(ctx, cfg.Queue.Name, cfg.Queue.TaskProducerInterval, store, jobRepo, dbBreaker, &wg)
 	go runOutboxRelay(ctx, 2*time.Second, store, jobRepo, &wg)
-	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, store, &wg)
+	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, store, jobRepo, &wg)
 	go runDelayedPoller(ctx, cfg.Queue.Name, cfg.Queue.DelayedPollEvery, store, &wg)
 	go runDepthCollector(ctx, cfg.Queue.Name, cfg.Queue.DepthPollEvery, store, &wg)
 	go runMetricsServer(ctx, cfg.Metrics.Addr, &wg)

@@ -17,6 +17,16 @@ type RedisStore struct {
 	holdTTL time.Duration
 }
 
+var reclaimAbandonedTaskScript = redis.NewScript(`
+	local removed = redis.call('LREM', KEYS[1], 1, ARGV[1])
+	if removed == 0 then
+		return 0
+	end
+	redis.call('HDEL', KEYS[2], ARGV[1])
+	redis.call('LPUSH', KEYS[3], ARGV[1])
+	return 1
+`)
+
 func NewRedisStore(ctx context.Context, cfg config.RedisConfig, holdTTL time.Duration) (*RedisStore, error) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     cfg.Address,
@@ -53,7 +63,7 @@ func (s *RedisStore) EnqueueTask(ctx context.Context, queueName string, taskId s
 // the inflight list, and records the dequeue time so the janitor can detect
 // stuck tasks. If recording the timestamp fails, the task is intentionally
 // pushed back onto the queue rather than left untracked in inflight — an
-// untracked inflight task is invisible to SweepAbondonedTasks and would
+// untracked inflight task is invisible to FindAbandonedTasks and would
 // never be retried or DLQ'd.
 func (s *RedisStore) ConsumeTask(ctx context.Context, queueName string) (string, error) {
 	inflightKey := queueName + ":inflight"
@@ -149,21 +159,25 @@ func (s *RedisStore) GetAndIncrementRetryCount(ctx context.Context, queueName, t
 	return count, nil
 }
 
-func (s *RedisStore) SweepAbondonedTasks(ctx context.Context, queueName string) error {
-	inflightKey := queueName + ":inflight"
+// FindAbandonedTasks returns expired inflight task IDs without moving them.
+// The janitor first updates Postgres to QUEUED, then calls
+// RequeueAbandonedTask. This ordering prevents a reclaimed Redis message from
+// being consumed while the durable job still belongs to a RUNNING attempt.
+func (s *RedisStore) FindAbandonedTasks(ctx context.Context, queueName string) ([]string, error) {
 	timeHashKey := queueName + ":timestamps"
 
 	timestamps, err := s.rdb.HGetAll(ctx, timeHashKey).Result()
 	if err != nil {
-		metrics.StoreErrors.WithLabelValues(queueName, "SweepAbondonedTasks").Inc()
-		return fmt.Errorf("[JANITOR] failed to get task timestamps: %w", err)
+		metrics.StoreErrors.WithLabelValues(queueName, "FindAbandonedTasks").Inc()
+		return nil, fmt.Errorf("[JANITOR] failed to get task timestamps: %w", err)
 	}
 	redisTime, err := s.rdb.Time(ctx).Result()
 	if err != nil {
-		metrics.StoreErrors.WithLabelValues(queueName, "SweepAbondonedTasks").Inc()
-		return fmt.Errorf("[JANITOR] failed to get Redis server time: %w", err)
+		metrics.StoreErrors.WithLabelValues(queueName, "FindAbandonedTasks").Inc()
+		return nil, fmt.Errorf("[JANITOR] failed to get Redis server time: %w", err)
 	}
 	now := redisTime.Unix()
+	reclaimed := make([]string, 0)
 	for taskId, tsStr := range timestamps {
 		startTime, err := strconv.ParseInt(tsStr, 10, 64)
 		if err != nil {
@@ -171,26 +185,30 @@ func (s *RedisStore) SweepAbondonedTasks(ctx context.Context, queueName string) 
 			continue
 		}
 		if now-startTime > int64(s.holdTTL.Seconds()) {
-			slog.Warn("[JANITOR] task held too long, moving back to queue", "taskId", taskId, "heldSeconds", now-startTime)
-			pipe := s.rdb.TxPipeline()
-			removed := pipe.LRem(ctx, inflightKey, 1, taskId)
-			pipe.HDel(ctx, timeHashKey, taskId)
-			pipe.LPush(ctx, queueName, taskId)
-			if _, err := pipe.Exec(ctx); err != nil {
-				metrics.StoreErrors.WithLabelValues(queueName, "SweepAbondonedTasks").Inc()
-				return fmt.Errorf("[JANITOR] failed to sweep abandoned task %s: %w", taskId, err)
-			}
-			if removed.Val() == 0 {
-				// We pushed a duplicate into the main queue even though the
-				// task wasn't actually in inflight (e.g. already acked
-				// concurrently). Flag it — this is how double-processing
-				// happens.
-				slog.Warn("[JANITOR] requeued task that was not present in inflight list, possible duplicate", "taskId", taskId)
-			}
-			metrics.TasksSwept.WithLabelValues(queueName).Inc()
+			slog.Warn("[JANITOR] task held too long, preparing recovery", "taskId", taskId, "heldSeconds", now-startTime)
+			reclaimed = append(reclaimed, taskId)
 		}
 	}
-	return nil
+	return reclaimed, nil
+}
+
+// RequeueAbandonedTask atomically moves a specific expired entry from
+// inflight back to the main queue. It returns false when another path already
+// removed that entry, avoiding the duplicate enqueue race in the old pipeline.
+func (s *RedisStore) RequeueAbandonedTask(ctx context.Context, queueName, taskID string) (bool, error) {
+	inflightKey := queueName + ":inflight"
+	timeHashKey := queueName + ":timestamps"
+
+	removed, err := reclaimAbandonedTaskScript.Run(ctx, s.rdb, []string{inflightKey, timeHashKey, queueName}, taskID).Int()
+	if err != nil {
+		metrics.StoreErrors.WithLabelValues(queueName, "RequeueAbandonedTask").Inc()
+		return false, fmt.Errorf("[JANITOR] failed to requeue abandoned task %s: %w", taskID, err)
+	}
+	if removed == 0 {
+		return false, nil
+	}
+	metrics.TasksSwept.WithLabelValues(queueName).Inc()
+	return true, nil
 }
 
 func (s *RedisStore) RetryTaskWithBackoff(ctx context.Context, queueName string, taskId string, currentRetry int) error {
