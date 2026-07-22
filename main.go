@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -41,10 +42,62 @@ func simulateProcessing(ctx context.Context, taskId string) error {
 	return nil
 }
 
+// startLeaseHeartbeat keeps a claimed job alive while its handler runs. If a
+// heartbeat reports that this attempt no longer owns the lease, it cancels the
+// handler context. Handlers must honor ctx cancellation before performing any
+// further side effects.
+func startLeaseHeartbeat(parent context.Context, queueName, taskID string, claim repository.JobClaim, leaseTTL time.Duration, jobRepo *repository.JobRepository) (context.Context, func() bool) {
+	processingCtx, cancelProcessing := context.WithCancel(parent)
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var leaseLost atomic.Bool
+
+	interval := leaseTTL / 3
+	if interval <= 0 {
+		interval = time.Millisecond
+	}
+
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-processingCtx.Done():
+				return
+			case <-stop:
+				return
+			case <-ticker.C:
+				renewed, err := jobRepo.RenewLease(processingCtx, queueName, taskID, claim.LeaseToken, leaseTTL)
+				if err != nil {
+					// A transient database failure should not immediately cancel a
+					// valid task. The next heartbeat can still renew before expiry.
+					slog.Warn("failed to renew job lease", "taskId", taskID, "attempt", claim.Attempt, "error", err)
+					continue
+				}
+				if !renewed {
+					leaseLost.Store(true)
+					slog.Warn("job lease lost; cancelling handler", "taskId", taskID, "attempt", claim.Attempt)
+					cancelProcessing()
+					return
+				}
+			}
+		}
+	}()
+
+	return processingCtx, func() bool {
+		close(stop)
+		cancelProcessing()
+		<-done
+		return leaseLost.Load()
+	}
+}
+
 // runWorker continuously consumes tasks from Redis, checks idempotency in Postgres,
 // processes them, and updates Postgres and Redis accordingly. It handles retries
 // and dead-lettering based on the Postgres job row's retry counter.
-func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
+func runWorker(ctx context.Context, queueName string, leaseTTL time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("worker thread started, waiting for tasks...")
 
@@ -72,12 +125,12 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 		slog.Info("task consumed, running idempotency check", "taskId", taskId)
 
-		var status string
+		var claim repository.JobClaim
 		var tryErr error
 
 		// Use circuit breaker for DB call
 		cbErr1 := dbBreaker.Call(func() error {
-			status, tryErr = jobRepo.TryStartJob(ctx, queueName, taskId)
+			claim, tryErr = jobRepo.TryStartJob(ctx, queueName, taskId, leaseTTL)
 			return tryErr
 		})
 
@@ -124,11 +177,17 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 			slog.Error("idempotency check failed, leaving task for janitor to recover", "taskId", taskId, "error", tryErr)
 			continue
 		}
-		slog.Info("idempotency check passed", "taskId", taskId, "status", status)
+		slog.Info("idempotency check passed", "taskId", taskId, "attempt", claim.Attempt)
 
+		processingCtx, stopHeartbeat := startLeaseHeartbeat(ctx, queueName, taskId, claim, leaseTTL, jobRepo)
 		processingStart := time.Now()
-		procErr := simulateProcessing(ctx, taskId)
+		procErr := simulateProcessing(processingCtx, taskId)
 		metrics.ProcessingDuration.WithLabelValues(queueName).Observe(time.Since(processingStart).Seconds())
+		leaseLost := stopHeartbeat()
+		if leaseLost {
+			slog.Warn("task handler stopped after losing lease; leaving Redis entry for recovery", "taskId", taskId, "attempt", claim.Attempt)
+			continue
+		}
 		if procErr == nil {
 			slog.Info("task processed successfully, completing and scheduling children", "taskId", taskId)
 
@@ -137,7 +196,7 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 				dbErr    error
 			)
 			cbErr3 := dbBreaker.Call(func() error {
-				children, dbErr = jobRepo.CompleteJobAndScheduleChildren(ctx, queueName, taskId)
+				children, dbErr = jobRepo.CompleteJobAndScheduleChildren(ctx, queueName, taskId, claim.LeaseToken)
 				return dbErr
 			})
 
@@ -152,6 +211,10 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 			}
 
 			if dbErr != nil {
+				if errors.Is(dbErr, repository.ErrLeaseLost) {
+					slog.Warn("task completed after lease expired; leaving Redis entry for recovery", "taskId", taskId, "attempt", claim.Attempt)
+					continue
+				}
 				slog.Error("failed to complete task and schedule children, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
 				// Exponential backoff to avoid hammering DB when it's down
 				backoff := time.Duration(rand.Intn(1000)) * time.Millisecond
@@ -184,7 +247,7 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 
 		// Use circuit breaker for DB call
 		cbErr2 := dbBreaker.Call(func() error {
-			currentRetry, maxRetry, dbErr = jobRepo.RecordFailure(ctx, queueName, taskId, procErr.Error())
+			currentRetry, maxRetry, dbErr = jobRepo.RecordFailure(ctx, queueName, taskId, claim.LeaseToken, procErr.Error())
 			return dbErr
 		})
 
@@ -199,6 +262,10 @@ func runWorker(ctx context.Context, queueName string, store *redis.RedisStore, j
 		}
 
 		if dbErr != nil {
+			if errors.Is(dbErr, repository.ErrLeaseLost) {
+				slog.Warn("task failed after lease expired; leaving Redis entry for recovery", "taskId", taskId, "attempt", claim.Attempt)
+				continue
+			}
 			slog.Error("failed to record failure in postgres, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
 			// Exponential backoff to avoid hammering DB when it's down
 			backoff := time.Duration(rand.Intn(1000)) * time.Millisecond
@@ -415,17 +482,24 @@ func runJanitor(ctx context.Context, queueName string, interval time.Duration, s
 				continue
 			}
 			for _, taskID := range reclaimed {
-				requeued, err := jobRepo.RequeueAbandonedJob(ctx, queueName, taskID)
+				action, err := jobRepo.RecoverExpiredJob(ctx, queueName, taskID)
 				if err != nil {
-					slog.Error("failed to return abandoned job to queued state", "taskId", taskID, "error", err)
+					slog.Error("failed to inspect expired job lease", "taskId", taskID, "error", err)
 					continue
 				}
-				if !requeued {
+				switch action {
+				case repository.RecoveryKeepInflight:
+					// The worker is alive and renewing its lease. The original
+					// Redis timestamp may be old, but it is not a recovery signal.
+					continue
+				case repository.RecoveryAcknowledge:
 					slog.Info("abandoned Redis entry belongs to a terminal or missing job, acknowledging it", "taskId", taskID)
 					if err := store.AcknowledgeTask(ctx, queueName, taskID); err != nil {
 						slog.Error("failed to remove terminal abandoned task from Redis", "taskId", taskID, "error", err)
 					}
 					continue
+				case repository.RecoveryRequeue:
+					// Continue below.
 				}
 				moved, err := store.RequeueAbandonedTask(ctx, queueName, taskID)
 				if err != nil {
@@ -589,7 +663,7 @@ func main() {
 
 	var wg sync.WaitGroup
 	wg.Add(7)
-	go runWorker(ctx, cfg.Queue.Name, store, jobRepo, dbBreaker, &wg)
+	go runWorker(ctx, cfg.Queue.Name, cfg.Queue.HoldTTL, store, jobRepo, dbBreaker, &wg)
 	go runProducer(ctx, cfg.Queue.Name, cfg.Queue.TaskProducerInterval, store, jobRepo, dbBreaker, &wg)
 	go runOutboxRelay(ctx, 2*time.Second, store, jobRepo, &wg)
 	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, store, jobRepo, &wg)

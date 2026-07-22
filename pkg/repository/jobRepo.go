@@ -19,6 +19,7 @@ var (
 	ErrJobAlreadyOwned = errors.New("job execution skipped: another worker owns this job")
 	ErrJobNotReady     = errors.New("job execution skipped: not queued or dependencies are incomplete")
 	ErrTerminalJob     = errors.New("job execution skipped: job is terminal")
+	ErrLeaseLost       = errors.New("job execution skipped: lease is no longer owned by this attempt")
 	// ErrJobNotFound means TryStartJob was called for a taskID with no
 	// corresponding processed_jobs row. Under this system's design that
 	// should never happen — every task is created in Postgres via CreateJob
@@ -55,6 +56,27 @@ type Task struct {
 type JobRepository struct {
 	pool *pgxpool.Pool
 }
+
+// JobClaim identifies one bounded execution attempt. The lease token is a
+// fencing token: every heartbeat, completion, and failure update must present
+// this exact value, so a stale worker cannot mutate a reclaimed job.
+type JobClaim struct {
+	LeaseToken uuid.UUID
+	Attempt    int
+}
+
+type RecoveryAction int
+
+const (
+	// RecoveryKeepInflight means the lease is still active; Redis must not move
+	// the message even if its original visibility timestamp is old.
+	RecoveryKeepInflight RecoveryAction = iota
+	// RecoveryRequeue means the durable lease expired and Redis may republish.
+	RecoveryRequeue
+	// RecoveryAcknowledge means the job is terminal or missing; discard the
+	// stale Redis inflight entry.
+	RecoveryAcknowledge
+)
 
 func NewJobRepository(pool *pgxpool.Pool) *JobRepository {
 	return &JobRepository{pool: pool}
@@ -156,81 +178,87 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 // TryStartJob atomically claims an eligible job. QUEUED is the only claimable
 // state. The dependency predicate is checked at claim time as a final guard
 // against stale or externally injected Redis messages.
-func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID string) (string, error) {
+func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID string, leaseTTL time.Duration) (JobClaim, error) {
 	id, err := uuid.Parse(taskID)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
-		return "", fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
+		return JobClaim{}, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
+	}
+	if leaseTTL <= 0 {
+		return JobClaim{}, fmt.Errorf("lease TTL must be positive")
 	}
 
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
-		return "", fmt.Errorf("failed to begin idempotency transaction: %w", err)
+		return JobClaim{}, fmt.Errorf("failed to begin idempotency transaction: %w", err)
 	}
 	defer tx.Rollback(ctx) // no-op if Commit succeeds first
 
-	var claimedStatus string
+	claim := JobClaim{LeaseToken: uuid.New()}
 	query := `
 		UPDATE processed_jobs AS job
-		SET status = $2
+		SET status = $2,
+		    lease_token = $3,
+		    lease_expires_at = NOW() + $4::interval,
+		    attempt_number = attempt_number + 1
 		WHERE job.id = $1
-		  AND job.status = $3
+		  AND job.status = $5
 		  AND job.available_at <= NOW()
 		  AND NOT EXISTS (
 			  SELECT 1
 			  FROM job_dependencies edge
 			  JOIN processed_jobs parent ON parent.id = edge.parent_job_id
 			  WHERE edge.child_job_id = job.id
-			    AND parent.status <> $4
+			    AND parent.status <> $6
 		  )
-		RETURNING job.status;
+		RETURNING lease_token, attempt_number;
 		`
-	err = tx.QueryRow(ctx, query, id, StatusRunning, StatusQueued, StatusCompleted).Scan(&claimedStatus)
+	err = tx.QueryRow(ctx, query, id, StatusRunning, claim.LeaseToken, leaseTTL.String(), StatusQueued, StatusCompleted).Scan(&claim.LeaseToken, &claim.Attempt)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
-			return "", fmt.Errorf("failed to claim job %s: %w", taskID, err)
+			return JobClaim{}, fmt.Errorf("failed to claim job %s: %w", taskID, err)
 		}
 
 		var status string
 		err = tx.QueryRow(ctx, `SELECT status FROM processed_jobs WHERE id = $1;`, id).Scan(&status)
 		if errors.Is(err, pgx.ErrNoRows) {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
-			return "", ErrJobNotFound
+			return JobClaim{}, ErrJobNotFound
 		}
 		if err != nil {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
-			return "", fmt.Errorf("failed to inspect unclaimable job %s: %w", taskID, err)
+			return JobClaim{}, fmt.Errorf("failed to inspect unclaimable job %s: %w", taskID, err)
 		}
 
 		switch status {
 		case StatusCompleted:
 			metrics.JobsDuplicateSkipped.WithLabelValues(queueName).Inc()
-			return "", ErrDuplicateJob
+			return JobClaim{}, ErrDuplicateJob
 		case StatusFailed, StatusCancelled:
-			return "", ErrTerminalJob
+			return JobClaim{}, ErrTerminalJob
 		case StatusRunning:
-			return "", ErrJobAlreadyOwned
+			return JobClaim{}, ErrJobAlreadyOwned
 		default:
-			return "", ErrJobNotReady
+			return JobClaim{}, ErrJobNotReady
 		}
 	}
 
-	slog.Info("[IDEMPOTENCY] job claimed", "taskId", taskID, "status", claimedStatus)
+	slog.Info("[IDEMPOTENCY] job claimed", "taskId", taskID, "attempt", claim.Attempt, "leaseToken", claim.LeaseToken)
 
 	if err := tx.Commit(ctx); err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
-		return "", fmt.Errorf("failed to commit idempotency transaction: %w", err)
+		return JobClaim{}, fmt.Errorf("failed to commit idempotency transaction: %w", err)
 	}
 
-	return claimedStatus, nil
+	return claim, nil
 }
 
 // RecordFailure increments the retry counter and stores the latest error,
 // transitioning status to FAILED once max_retries is reached. Returns the
 // updated (currentRetries, maxRetries) so the caller can decide retry vs DLQ.
-func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID, errLog string) (currentRetries int, maxRetries int, err error) {
+func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID string, leaseToken uuid.UUID, errLog string) (currentRetries int, maxRetries int, err error) {
 	id, parseErr := uuid.Parse(taskID)
 	if parseErr != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "RecordFailure").Inc()
@@ -248,12 +276,20 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID, er
 		    available_at = CASE
 				WHEN current_retries + 1 >= max_retries THEN NOW()
 				ELSE NOW() + make_interval(secs => ((1::bigint << (current_retries + 1))::double precision))
-			END
+			END,
+			lease_token = NULL,
+			lease_expires_at = NULL
 		WHERE id = $1
+		  AND status = $5
+		  AND lease_token = $6
+		  AND lease_expires_at > NOW()
 		RETURNING current_retries, max_retries;
 	`
-	err = r.pool.QueryRow(ctx, query, id, errLog, StatusFailed, StatusQueued).Scan(&currentRetries, &maxRetries)
+	err = r.pool.QueryRow(ctx, query, id, errLog, StatusFailed, StatusQueued, StatusRunning, leaseToken).Scan(&currentRetries, &maxRetries)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, 0, ErrLeaseLost
+		}
 		metrics.JobRepoErrors.WithLabelValues(queueName, "RecordFailure").Inc()
 		return 0, 0, fmt.Errorf("failed to record failure for task %s: %w", taskID, err)
 	}
@@ -263,41 +299,79 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID, er
 	return currentRetries, maxRetries, nil
 }
 
-// RequeueAbandonedJob moves a job from RUNNING to QUEUED before the janitor
-// republishes its Redis entry. QUEUED is also accepted to make recovery
-// idempotent if the process crashed after the DB transition but before Redis
-// was updated. A false result means the job is terminal or missing.
-func (r *JobRepository) RequeueAbandonedJob(ctx context.Context, queueName, taskID string) (bool, error) {
+// RenewLease extends an active attempt using the database clock. It returns
+// false when another attempt reclaimed the job or the lease already expired.
+func (r *JobRepository) RenewLease(ctx context.Context, queueName, taskID string, leaseToken uuid.UUID, leaseTTL time.Duration) (bool, error) {
 	id, err := uuid.Parse(taskID)
 	if err != nil {
-		metrics.JobRepoErrors.WithLabelValues(queueName, "RequeueAbandonedJob").Inc()
+		metrics.JobRepoErrors.WithLabelValues(queueName, "RenewLease").Inc()
 		return false, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
+	}
+	if leaseTTL <= 0 {
+		return false, fmt.Errorf("lease TTL must be positive")
+	}
+
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE processed_jobs
+		SET lease_expires_at = NOW() + $3::interval
+		WHERE id = $1
+		  AND status = $4
+		  AND lease_token = $2
+		  AND lease_expires_at > NOW();
+	`, id, leaseToken, leaseTTL.String(), StatusRunning)
+	if err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "RenewLease").Inc()
+		return false, fmt.Errorf("failed to renew lease for job %s: %w", taskID, err)
+	}
+	return tag.RowsAffected() == 1, nil
+}
+
+// RecoverExpiredJob tells the janitor whether a Redis inflight entry may be
+// moved. The Redis visibility timestamp is only a prompt: recovery happens
+// solely after the durable Postgres lease has expired.
+func (r *JobRepository) RecoverExpiredJob(ctx context.Context, queueName, taskID string) (RecoveryAction, error) {
+	id, err := uuid.Parse(taskID)
+	if err != nil {
+		metrics.JobRepoErrors.WithLabelValues(queueName, "RecoverExpiredJob").Inc()
+		return RecoveryKeepInflight, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
 	}
 
 	tag, err := r.pool.Exec(ctx, `
 		UPDATE processed_jobs
 		SET status = $2,
-		    available_at = NOW()
-		WHERE id = $1 AND status = $3;
+		    available_at = NOW(),
+		    lease_token = NULL,
+		    lease_expires_at = NULL
+		WHERE id = $1
+		  AND status = $3
+		  AND lease_expires_at <= NOW();
 	`, id, StatusQueued, StatusRunning)
 	if err != nil {
-		metrics.JobRepoErrors.WithLabelValues(queueName, "RequeueAbandonedJob").Inc()
-		return false, fmt.Errorf("failed to requeue abandoned job %s: %w", taskID, err)
+		metrics.JobRepoErrors.WithLabelValues(queueName, "RecoverExpiredJob").Inc()
+		return RecoveryKeepInflight, fmt.Errorf("failed to recover expired job %s: %w", taskID, err)
 	}
 	if tag.RowsAffected() == 1 {
-		return true, nil
+		return RecoveryRequeue, nil
 	}
 
 	var status string
 	err = r.pool.QueryRow(ctx, `SELECT status FROM processed_jobs WHERE id = $1;`, id).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, nil
+		return RecoveryAcknowledge, nil
 	}
 	if err != nil {
-		metrics.JobRepoErrors.WithLabelValues(queueName, "RequeueAbandonedJob").Inc()
-		return false, fmt.Errorf("failed to inspect abandoned job %s: %w", taskID, err)
+		metrics.JobRepoErrors.WithLabelValues(queueName, "RecoverExpiredJob").Inc()
+		return RecoveryKeepInflight, fmt.Errorf("failed to inspect abandoned job %s: %w", taskID, err)
 	}
-	return status == StatusQueued, nil
+	if status == StatusQueued {
+		// The process may have crashed after changing Postgres to QUEUED but
+		// before it republished the Redis entry. Repeating the move is safe.
+		return RecoveryRequeue, nil
+	}
+	if status == StatusRunning {
+		return RecoveryKeepInflight, nil
+	}
+	return RecoveryAcknowledge, nil
 }
 
 // CompleteJobAndScheduleChildren durably completes a job and promotes every
@@ -309,7 +383,7 @@ func (r *JobRepository) RequeueAbandonedJob(ctx context.Context, queueName, task
 // This matters for a multi-parent child: two parents may finish concurrently;
 // without serialization each transaction could observe the other as RUNNING
 // and neither would promote the child.
-func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queueName, taskID string) ([]string, error) {
+func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queueName, taskID string, leaseToken uuid.UUID) ([]string, error) {
 	id, err := uuid.Parse(taskID)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
@@ -326,14 +400,20 @@ func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queu
 	var workflowID uuid.UUID
 	err = tx.QueryRow(ctx, `
 		UPDATE processed_jobs
-		SET status = $2, processed_at = NOW()
-		WHERE id = $1 AND status = $3
+		SET status = $2,
+		    processed_at = NOW(),
+		    lease_token = NULL,
+		    lease_expires_at = NULL
+		WHERE id = $1
+		  AND status = $3
+		  AND lease_token = $4
+		  AND lease_expires_at > NOW()
 		RETURNING workflow_id;
-	`, id, StatusCompleted, StatusRunning).Scan(&workflowID)
+	`, id, StatusCompleted, StatusRunning, leaseToken).Scan(&workflowID)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("cannot complete job %s: job is missing or not RUNNING", taskID)
+			return nil, ErrLeaseLost
 		}
 		return nil, fmt.Errorf("failed to complete job %s: %w", taskID, err)
 	}
@@ -431,7 +511,9 @@ func (r *JobRepository) MarkAsCancelledCascading(ctx context.Context, queueName,
 		)
 		CYCLE child_job_id USING path
 		UPDATE processed_jobs
-		SET status = $2
+		SET status = $2,
+		    lease_token = NULL,
+		    lease_expires_at = NULL
 		WHERE id IN (SELECT child_job_id FROM descendants)
 		  AND status IN ($3, $4, $5);  -- Only cancel PENDING/QUEUED/RUNNING
 	`
