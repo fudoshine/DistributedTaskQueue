@@ -24,17 +24,16 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// simulateProcessing stands in for real task work. Replace with real
-// processing logic; keep the ctx-cancellation check if real work is itself
-// cancellable.
-func simulateProcessing(ctx context.Context, taskId string) error {
+const (
+	outboxBatchSize   = 100
+	recoveryBatchSize = 100
+)
+
+func simulateProcessing(ctx context.Context, taskID string) error {
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-time.After(2 * time.Second):
-	}
-	if ctx.Err() != nil {
-		return ctx.Err()
 	}
 	if rand.Intn(5) == 0 {
 		return errors.New("simulated processing failure")
@@ -42,26 +41,22 @@ func simulateProcessing(ctx context.Context, taskId string) error {
 	return nil
 }
 
-// startLeaseHeartbeat keeps a claimed job alive while its handler runs. If a
-// heartbeat reports that this attempt no longer owns the lease, it cancels the
-// handler context. Handlers must honor ctx cancellation before performing any
-// further side effects.
-func startLeaseHeartbeat(parent context.Context, queueName, taskID string, claim repository.JobClaim, leaseTTL time.Duration, jobRepo *repository.JobRepository) (context.Context, func() bool) {
-	processingCtx, cancelProcessing := context.WithCancel(parent)
+// startLeaseHeartbeat renews the durable fence and resets Stream PEL idle time.
+// Postgres remains the authority: a Redis heartbeat failure never permits a
+// stale completion, and a DB lease loss cancels the handler.
+func startLeaseHeartbeat(parent context.Context, queueName, consumer string, delivery redis.Delivery, claim repository.JobClaim, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository) (context.Context, func() bool) {
+	processingCtx, cancel := context.WithCancel(parent)
 	stop := make(chan struct{})
 	done := make(chan struct{})
-	var leaseLost atomic.Bool
-
+	var lost atomic.Bool
 	interval := leaseTTL / 3
 	if interval <= 0 {
-		interval = time.Millisecond
+		interval = time.Second
 	}
-
 	go func() {
 		defer close(done)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
-
 		for {
 			select {
 			case <-processingCtx.Done():
@@ -69,626 +64,367 @@ func startLeaseHeartbeat(parent context.Context, queueName, taskID string, claim
 			case <-stop:
 				return
 			case <-ticker.C:
-				renewed, err := jobRepo.RenewLease(processingCtx, queueName, taskID, claim.LeaseToken, leaseTTL)
+				renewed, err := jobs.RenewLease(processingCtx, queueName, delivery.TaskID, claim.LeaseToken, leaseTTL)
 				if err != nil {
-					// A transient database failure should not immediately cancel a
-					// valid task. The next heartbeat can still renew before expiry.
-					slog.Warn("failed to renew job lease", "taskId", taskID, "attempt", claim.Attempt, "error", err)
+					slog.Warn("lease heartbeat failed", "taskId", delivery.TaskID, "error", err)
 					continue
 				}
 				if !renewed {
-					leaseLost.Store(true)
-					slog.Warn("job lease lost; cancelling handler", "taskId", taskID, "attempt", claim.Attempt)
-					cancelProcessing()
+					lost.Store(true)
+					cancel()
 					return
+				}
+				if err := store.TouchDelivery(processingCtx, queueName, consumer, delivery.StreamID); err != nil {
+					slog.Warn("stream heartbeat failed; DB lease remains authoritative", "streamId", delivery.StreamID, "error", err)
 				}
 			}
 		}
 	}()
+	return processingCtx, func() bool { close(stop); cancel(); <-done; return lost.Load() }
+}
 
-	return processingCtx, func() bool {
-		close(stop)
-		cancelProcessing()
-		<-done
-		return leaseLost.Load()
+func acknowledge(ctx context.Context, store *redis.RedisStore, queueName string, delivery redis.Delivery) {
+	if err := store.AcknowledgeDelivery(ctx, queueName, delivery.StreamID); err != nil {
+		slog.Error("failed to acknowledge stream delivery", "streamId", delivery.StreamID, "taskId", delivery.TaskID, "error", err)
 	}
 }
 
-// runWorker continuously consumes tasks from Redis, checks idempotency in Postgres,
-// processes them, and updates Postgres and Redis accordingly. It handles retries
-// and dead-lettering based on the Postgres job row's retry counter.
-func runWorker(ctx context.Context, queueName string, leaseTTL time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
-	defer wg.Done()
-	slog.Info("worker thread started, waiting for tasks...")
-
-	for {
-		if ctx.Err() != nil {
-			slog.Info("worker thread received shutdown signal, exiting...")
+func processDelivery(ctx context.Context, queueName, consumer string, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, delivery redis.Delivery) {
+	var claim repository.JobClaim
+	var claimErr error
+	cbErr := dbBreaker.Call(func() error {
+		claim, claimErr = jobs.TryStartJob(ctx, queueName, delivery.TaskID, delivery.DeliveryID, delivery.Generation, leaseTTL)
+		return claimErr
+	})
+	if cbErr != nil {
+		claimErr = cbErr
+	}
+	if claimErr != nil {
+		switch {
+		case errors.Is(claimErr, repository.ErrJobAlreadyOwned),
+			errors.Is(claimErr, repository.ErrStaleDelivery),
+			errors.Is(claimErr, repository.ErrDuplicateJob),
+			errors.Is(claimErr, repository.ErrTerminalJob),
+			errors.Is(claimErr, repository.ErrJobNotReady):
+			// This Stream entry cannot become the current execution any more.
+			acknowledge(ctx, store, queueName, delivery)
+			return
+		case errors.Is(claimErr, repository.ErrJobNotFound):
+			slog.Error("stream delivery has no job row; moving to DLQ", "taskId", delivery.TaskID)
+			if err := store.MoveToDeadLetterQueue(ctx, queueName, delivery); err == nil {
+				acknowledge(ctx, store, queueName, delivery)
+			}
+			return
+		default:
+			// Leave PEL entry unacked. XAUTOCLAIM and the durable DB recovery
+			// sweep will retry once the backend is healthy.
+			slog.Warn("claim failed; retaining PEL delivery for recovery", "taskId", delivery.TaskID, "error", claimErr)
 			return
 		}
+	}
 
-		taskId, err := store.ConsumeTask(ctx, queueName)
-		if err != nil {
-			if ctx.Err() != nil {
-				slog.Info("worker thread received shutdown signal, exiting...")
+	processingCtx, stopHeartbeat := startLeaseHeartbeat(ctx, queueName, consumer, delivery, claim, leaseTTL, store, jobs)
+	started := time.Now()
+	processingErr := simulateProcessing(processingCtx, delivery.TaskID)
+	metrics.ProcessingDuration.WithLabelValues(queueName).Observe(time.Since(started).Seconds())
+	if stopHeartbeat() {
+		return
+	}
+
+	if processingErr == nil {
+		var children []string
+		var completeErr error
+		cbErr := dbBreaker.Call(func() error {
+			children, completeErr = jobs.CompleteJobAndScheduleChildren(ctx, queueName, delivery.TaskID, claim.LeaseToken)
+			return completeErr
+		})
+		if cbErr != nil {
+			completeErr = cbErr
+		}
+		if completeErr != nil {
+			if errors.Is(completeErr, repository.ErrLeaseLost) {
 				return
 			}
-			slog.Error("failed to consume task", "error", err)
-			// Exponential backoff with jitter to avoid hammering Redis
-			backoff := time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
-			time.Sleep(backoff)
+			slog.Warn("completion failed; retaining PEL delivery for recovery", "taskId", delivery.TaskID, "error", completeErr)
+			return
+		}
+		if len(children) > 0 {
+			slog.Info("scheduled ready child deliveries", "taskId", delivery.TaskID, "count", len(children))
+		}
+		if workflowID, err := jobs.GetWorkflowID(ctx, delivery.TaskID); err == nil {
+			if err := jobs.UpdateWorkflowStatus(ctx, workflowID); err != nil {
+				slog.Warn("update workflow status", "error", err)
+			}
+		}
+		acknowledge(ctx, store, queueName, delivery)
+		return
+	}
+
+	metrics.ProcessingFailures.WithLabelValues(queueName).Inc()
+	var currentRetry, maxRetry int
+	var failureErr error
+	cbErr = dbBreaker.Call(func() error {
+		currentRetry, maxRetry, failureErr = jobs.RecordFailure(ctx, queueName, delivery.TaskID, claim.LeaseToken, processingErr.Error())
+		return failureErr
+	})
+	if cbErr != nil {
+		failureErr = cbErr
+	}
+	if failureErr != nil {
+		if !errors.Is(failureErr, repository.ErrLeaseLost) {
+			slog.Warn("record failure failed; retaining PEL delivery", "taskId", delivery.TaskID, "error", failureErr)
+		}
+		return
+	}
+	if currentRetry >= maxRetry {
+		if err := jobs.MarkAsCancelledCascading(ctx, queueName, delivery.TaskID); err != nil {
+			slog.Warn("cascade cancellation failed", "error", err)
+		}
+		if err := store.MoveToDeadLetterQueue(ctx, queueName, delivery); err != nil {
+			slog.Error("move terminal job to DLQ", "error", err)
+			return
+		}
+		if workflowID, err := jobs.GetWorkflowID(ctx, delivery.TaskID); err == nil {
+			_ = jobs.UpdateWorkflowStatus(ctx, workflowID)
+		}
+	}
+	// For a non-terminal failure RecordFailure inserted the next durable outbox
+	// generation in the same transaction. The old PEL entry is now stale.
+	acknowledge(ctx, store, queueName, delivery)
+}
+
+func runWorker(ctx context.Context, queueName, consumer string, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
+	defer wg.Done()
+	slog.Info("stream worker started", "consumer", consumer)
+	for ctx.Err() == nil {
+		delivery, err := store.ConsumeDelivery(ctx, queueName, consumer)
+		if err != nil {
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Error("consume stream delivery", "consumer", consumer, "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(time.Second):
+			}
 			continue
 		}
-		if taskId == "" {
+		if delivery.StreamID == "" {
 			continue
 		}
+		processDelivery(ctx, queueName, consumer, leaseTTL, store, jobs, dbBreaker, delivery)
+	}
+}
 
-		slog.Info("task consumed, running idempotency check", "taskId", taskId)
-
-		var claim repository.JobClaim
-		var tryErr error
-
-		// Use circuit breaker for DB call
-		cbErr1 := dbBreaker.Call(func() error {
-			claim, tryErr = jobRepo.TryStartJob(ctx, queueName, taskId, leaseTTL)
-			return tryErr
-		})
-
-		if cbErr1 != nil {
-			if errors.Is(cbErr1, circuitbreaker.ErrCircuitOpen) {
-				slog.Warn("circuit breaker open, skipping DB call", "taskId", taskId)
-				// Leave task in inflight, janitor will recover
-				time.Sleep(time.Second)
+func runOutboxRelay(ctx context.Context, interval, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, wg *sync.WaitGroup) {
+	defer wg.Done()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			entries, token, err := jobs.ClaimPendingOutbox(ctx, outboxBatchSize, leaseTTL)
+			if err != nil {
+				slog.Error("claim outbox", "error", err)
 				continue
 			}
-			tryErr = cbErr1
-		}
-
-		if tryErr != nil {
-			if errors.Is(tryErr, repository.ErrDuplicateJob) ||
-				errors.Is(tryErr, repository.ErrTerminalJob) ||
-				errors.Is(tryErr, repository.ErrJobNotReady) {
-				slog.Warn("task is not executable, dropping stale Redis message", "taskId", taskId, "error", tryErr)
-				metrics.TasksAcknowledged.WithLabelValues(queueName).Inc()
-				if err := store.AcknowledgeTask(ctx, queueName, taskId); err != nil {
-					slog.Error("failed to remove stale task from Redis", "taskId", taskId, "error", err)
-				}
-				continue
-			}
-			if errors.Is(tryErr, repository.ErrJobNotFound) {
-				slog.Error("[IDEMPOTENCY] task in Redis but no DB row exists - data inconsistency, moving to DLQ", "taskId", taskId)
-				metrics.TasksOrphaned.WithLabelValues(queueName).Inc()
-				if err := store.MoveToDeadLetterQueue(ctx, queueName, taskId); err != nil {
-					slog.Error("failed to move orphaned task to DLQ", "taskId", taskId, "error", err)
-				}
-				continue
-			}
-			if errors.Is(tryErr, repository.ErrJobAlreadyOwned) {
-				// A concurrent worker still owns the durable RUNNING state. Leave
-				// this Redis copy in inflight; the janitor will reclaim it only if
-				// that worker fails to finish before the visibility timeout.
-				slog.Warn("task is already owned by another worker, leaving for janitor", "taskId", taskId)
-				continue
-			}
-			// Any other error (DB down, timeout, etc): task stays claimed in
-			// Redis inflight. We deliberately do NOT retry/DLQ here — we
-			// leave it for the janitor to sweep back to the main queue after
-			// holdTTL, since we don't know if the DB write actually landed.
-			slog.Error("idempotency check failed, leaving task for janitor to recover", "taskId", taskId, "error", tryErr)
-			continue
-		}
-		slog.Info("idempotency check passed", "taskId", taskId, "attempt", claim.Attempt)
-
-		processingCtx, stopHeartbeat := startLeaseHeartbeat(ctx, queueName, taskId, claim, leaseTTL, jobRepo)
-		processingStart := time.Now()
-		procErr := simulateProcessing(processingCtx, taskId)
-		metrics.ProcessingDuration.WithLabelValues(queueName).Observe(time.Since(processingStart).Seconds())
-		leaseLost := stopHeartbeat()
-		if leaseLost {
-			slog.Warn("task handler stopped after losing lease; leaving Redis entry for recovery", "taskId", taskId, "attempt", claim.Attempt)
-			continue
-		}
-		if procErr == nil {
-			slog.Info("task processed successfully, completing and scheduling children", "taskId", taskId)
-
-			var (
-				children []string
-				dbErr    error
-			)
-			cbErr3 := dbBreaker.Call(func() error {
-				children, dbErr = jobRepo.CompleteJobAndScheduleChildren(ctx, queueName, taskId, claim.LeaseToken)
-				return dbErr
-			})
-
-			if cbErr3 != nil {
-				if errors.Is(cbErr3, circuitbreaker.ErrCircuitOpen) {
-					slog.Warn("circuit breaker open for DB, skipping completion record", "taskId", taskId)
-					// Leave task in inflight, janitor will recover
-					time.Sleep(time.Second)
+			for _, entry := range entries {
+				if err := store.PublishDelivery(ctx, entry.QueueName, entry.TaskID.String(), entry.DeliveryID.String(), entry.Generation); err != nil {
+					slog.Warn("publish outbox delivery", "outboxId", entry.OutboxID, "error", err)
+					_ = jobs.ReleaseOutboxLease(ctx, entry.OutboxID, token)
 					continue
 				}
-				dbErr = cbErr3
-			}
-
-			if dbErr != nil {
-				if errors.Is(dbErr, repository.ErrLeaseLost) {
-					slog.Warn("task completed after lease expired; leaving Redis entry for recovery", "taskId", taskId, "attempt", claim.Attempt)
+				if err := jobs.MarkOutboxDelivered(ctx, entry.OutboxID, token); err != nil {
+					slog.Warn("mark outbox delivery", "outboxId", entry.OutboxID, "error", err)
 					continue
 				}
-				slog.Error("failed to complete task and schedule children, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
-				// Exponential backoff to avoid hammering DB when it's down
-				backoff := time.Duration(rand.Intn(1000)) * time.Millisecond
-				time.Sleep(backoff)
-				continue
+				metrics.OutboxRelayed.WithLabelValues(entry.QueueName).Inc()
 			}
-			if len(children) > 0 {
-				slog.Info("scheduled ready children through outbox", "parentTask", taskId, "childCount", len(children))
-			}
-
-			workflowID, err := jobRepo.GetWorkflowID(ctx, taskId)
-			if err != nil {
-				slog.Error("failed to get workflow_id for status update", "taskId", taskId, "error", err)
-			} else if err := jobRepo.UpdateWorkflowStatus(ctx, workflowID); err != nil {
-				slog.Error("failed to update workflow status", "workflowId", workflowID, "error", err)
-			}
-
-			if err := store.AcknowledgeTask(ctx, queueName, taskId); err != nil {
-				slog.Error("failed to acknowledge task in Redis, leaving for janitor to recover", "taskId", taskId, "error", err)
-			}
-			continue
-		}
-		// Processing failed. Decide retry vs dead-letter using the DB's
-		// per-job retry counter as the source of truth.
-		metrics.ProcessingFailures.WithLabelValues(queueName).Inc()
-		slog.Warn("task processing failed, recording failure in postgres", "taskId", taskId, "error", procErr)
-
-		var currentRetry, maxRetry int
-		var dbErr error
-
-		// Use circuit breaker for DB call
-		cbErr2 := dbBreaker.Call(func() error {
-			currentRetry, maxRetry, dbErr = jobRepo.RecordFailure(ctx, queueName, taskId, claim.LeaseToken, procErr.Error())
-			return dbErr
-		})
-
-		if cbErr2 != nil {
-			if errors.Is(cbErr2, circuitbreaker.ErrCircuitOpen) {
-				slog.Warn("circuit breaker open for DB, skipping failure record", "taskId", taskId)
-				// Leave task in inflight, janitor will recover
-				time.Sleep(time.Second)
-				continue
-			}
-			dbErr = cbErr2
-		}
-
-		if dbErr != nil {
-			if errors.Is(dbErr, repository.ErrLeaseLost) {
-				slog.Warn("task failed after lease expired; leaving Redis entry for recovery", "taskId", taskId, "attempt", claim.Attempt)
-				continue
-			}
-			slog.Error("failed to record failure in postgres, leaving for janitor to recover", "taskId", taskId, "error", dbErr)
-			// Exponential backoff to avoid hammering DB when it's down
-			backoff := time.Duration(rand.Intn(1000)) * time.Millisecond
-			time.Sleep(backoff)
-			continue
-		}
-
-		if currentRetry >= maxRetry {
-			slog.Error("task exceeded max retries, moving to DLQ", "taskId", taskId, "retries", currentRetry, "maxRetries", maxRetry)
-
-			// Cancel all dependent children since this parent will never complete
-			if err := jobRepo.MarkAsCancelledCascading(ctx, queueName, taskId); err != nil {
-				slog.Error("failed to cascade cancellation to children", "taskId", taskId, "error", err)
-			}
-
-			if err := store.MoveToDeadLetterQueue(ctx, queueName, taskId); err != nil {
-				slog.Error("failed to move task to DLQ, leaving for janitor to recover", "taskId", taskId, "error", err)
-			}
-
-			// Update workflow status (task failed, workflow might be failed too)
-			workflowID, err := jobRepo.GetWorkflowID(ctx, taskId)
-			if err != nil {
-				slog.Error("failed to get workflow_id for status update", "taskId", taskId, "error", err)
-			} else {
-				if err := jobRepo.UpdateWorkflowStatus(ctx, workflowID); err != nil {
-					slog.Error("failed to update workflow status", "workflowId", workflowID, "error", err)
-				}
-			}
-			continue
-		}
-
-		slog.Warn("scheduling backoff retry", "taskId", taskId, "attempt", currentRetry, "max", maxRetry)
-		if err := store.RetryTaskWithBackoff(ctx, queueName, taskId, currentRetry); err != nil {
-			slog.Error("failed to schedule retry, leaving for janitor to recover", "taskId", taskId, "error", err)
 		}
 	}
 }
 
-// retryWithBackoff retries fn up to maxAttempts times with exponential backoff
-// (1s, 2s, 4s, ...). Respects ctx cancellation between attempts.
+func runJanitor(ctx context.Context, queueName string, interval, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, wg *sync.WaitGroup) {
+	defer wg.Done()
+	sweep := func() {
+		if recovered, err := jobs.RecoverExpiredLeases(ctx, queueName, recoveryBatchSize); err != nil {
+			slog.Error("recover expired DB leases", "error", err)
+		} else if len(recovered) > 0 {
+			slog.Warn("scheduled expired job recoveries", "count", len(recovered))
+		}
+		idle, err := store.ClaimIdleDeliveries(ctx, queueName, leaseTTL, recoveryBatchSize)
+		if err != nil {
+			slog.Error("claim idle PEL deliveries", "error", err)
+			return
+		}
+		for _, delivery := range idle {
+			action, err := jobs.RecoverIdleDelivery(ctx, queueName, delivery.TaskID, delivery.Generation)
+			if err != nil {
+				slog.Warn("recover idle delivery", "streamId", delivery.StreamID, "error", err)
+				continue
+			}
+			if action != repository.RecoveryKeepInflight {
+				acknowledge(ctx, store, queueName, delivery)
+			}
+		}
+	}
+	// A startup sweep reduces downtime recovery latency without recovering a
+	// live attempt: every decision still uses the DB lease condition.
+	sweep()
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			sweep()
+		}
+	}
+}
+
 func retryWithBackoff(ctx context.Context, maxAttempts int, fn func() error) error {
 	var err error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
-		err = fn()
-		if err == nil {
+		if err = fn(); err == nil {
 			return nil
 		}
 		if attempt == maxAttempts-1 {
 			break
 		}
-		backoff := time.Duration(1<<uint(attempt))*time.Second + time.Duration(rand.Intn(1000))*time.Millisecond
-		slog.Warn("retrying after backoff", "attempt", attempt+1, "maxAttempts", maxAttempts, "backoff", backoff, "error", err)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case <-time.After(backoff):
+		case <-time.After(time.Duration(1<<uint(attempt)) * time.Second):
 		}
 	}
 	return err
 }
 
-// runProducer generates tasks at a fixed interval, creating a workflow and jobs in Postgres, then enqueuing them to Redis.
-// runProducer creates a new 3-step DAG pipeline on every tick:
-//
-//	Upload → Transcode → Notify
-//
-// Each pipeline is its own workflow. Only the root task (Upload) is written
-// to the outbox — the worker automatically enqueues Transcode once Upload
-// completes, and Notify once Transcode completes.
-func runProducer(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
+func runProducer(ctx context.Context, queueName string, interval time.Duration, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
 	defer wg.Done()
-	slog.Info("producer thread started, generating DAG pipelines...")
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
-	pipelineCounter := 1
-
-	for {
+	for n := 1; ; n++ {
 		select {
 		case <-ctx.Done():
-			slog.Info("producer thread received shutdown signal, exiting...")
 			return
 		case <-ticker.C:
-			// Each tick creates one complete workflow: Upload → Transcode → Notify
 			var workflowID uuid.UUID
-			err := retryWithBackoff(ctx, 5, func() error {
+			err := retryWithBackoff(ctx, 3, func() error {
 				return dbBreaker.Call(func() error {
-					var createErr error
-					workflowID, createErr = jobRepo.CreateWorkflow(ctx, fmt.Sprintf("video-pipeline-%d", pipelineCounter))
-					return createErr
+					var e error
+					workflowID, e = jobs.CreateWorkflow(ctx, fmt.Sprintf("video-pipeline-%d", n))
+					return e
 				})
 			})
 			if err != nil {
-				slog.Error("failed to create workflow, skipping pipeline", "pipeline", pipelineCounter, "error", err)
+				slog.Error("create workflow", "error", err)
 				continue
 			}
-
-			uploadID := uuid.New()
-			transcodeID := uuid.New()
-			notifyID := uuid.New()
-
-			pipeline := []repository.Task{
-				{
-					ID:         uploadID,
-					WorkflowID: workflowID,
-					ParentIDs:  []uuid.UUID{}, // root — goes to outbox
-					TaskType:   "VIDEO_UPLOAD",
-					Payload:    json.RawMessage(`{"file":"video.mp4"}`),
-				},
-				{
-					ID:         transcodeID,
-					WorkflowID: workflowID,
-					ParentIDs:  []uuid.UUID{uploadID}, // waits for upload
-					TaskType:   "VIDEO_TRANSCODE",
-					Payload:    json.RawMessage(`{"resolution":"1080p"}`),
-				},
-				{
-					ID:         notifyID,
-					WorkflowID: workflowID,
-					ParentIDs:  []uuid.UUID{transcodeID}, // waits for transcode
-					TaskType:   "VIDEO_NOTIFY",
-					Payload:    json.RawMessage(`{"channel":"email"}`),
-				},
+			upload, transcode, notify := uuid.New(), uuid.New(), uuid.New()
+			tasks := []repository.Task{
+				{ID: upload, WorkflowID: workflowID, TaskType: "VIDEO_UPLOAD", Payload: json.RawMessage(`{"file":"video.mp4"}`)},
+				{ID: transcode, WorkflowID: workflowID, ParentIDs: []uuid.UUID{upload}, TaskType: "VIDEO_TRANSCODE", Payload: json.RawMessage(`{"resolution":"1080p"}`)},
+				{ID: notify, WorkflowID: workflowID, ParentIDs: []uuid.UUID{transcode}, TaskType: "VIDEO_NOTIFY", Payload: json.RawMessage(`{"channel":"email"}`)},
 			}
-
-			// Write all 3 tasks to DB atomically — only root goes to outbox
-			allCreated := true
-			for _, task := range pipeline {
-				t := task // capture
-				err := retryWithBackoff(ctx, 3, func() error {
-					return dbBreaker.Call(func() error {
-						return jobRepo.CreateJob(ctx, queueName, t)
-					})
-				})
-				if err != nil {
-					slog.Error("failed to create task in pipeline, skipping workflow", "taskType", t.TaskType, "workflowId", workflowID, "error", err)
-					allCreated = false
+			for _, task := range tasks {
+				if err := jobs.CreateJob(ctx, queueName, task); err != nil {
+					slog.Error("create task", "taskId", task.ID, "error", err)
 					break
 				}
 			}
-
-			if allCreated {
-				slog.Info("pipeline created, relay will enqueue upload task",
-					"pipeline", pipelineCounter,
-					"workflowId", workflowID,
-					"tasks", []string{"VIDEO_UPLOAD", "VIDEO_TRANSCODE", "VIDEO_NOTIFY"},
-				)
-				pipelineCounter++
-			}
 		}
 	}
 }
 
-// runOutboxRelay polls the outbox table for undelivered rows and enqueues
-// each task to Redis, then marks the row delivered. Because the outbox row
-// is written in the same DB transaction as the processed_jobs row, this
-// guarantees at-least-once delivery to Redis even across server crashes.
-func runOutboxRelay(ctx context.Context, interval time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
-	defer wg.Done()
-	slog.Info("outbox relay started")
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("outbox relay received shutdown signal, exiting...")
-			return
-		case <-ticker.C:
-			entries, err := jobRepo.GetPendingOutbox(ctx)
-			if err != nil {
-				slog.Error("outbox relay failed to read pending entries", "error", err)
-				continue
-			}
-			if len(entries) == 0 {
-				continue
-			}
-
-			for _, entry := range entries {
-				if err := store.EnqueueTask(ctx, entry.QueueName, entry.TaskID.String()); err != nil {
-					slog.Error("outbox relay failed to enqueue task", "taskId", entry.TaskID, "error", err)
-					continue // leave outbox row undelivered, retry next tick
-				}
-				if err := jobRepo.MarkOutboxDelivered(ctx, entry.ID); err != nil {
-					slog.Error("outbox relay failed to mark row delivered, task may be double-enqueued on next tick", "outboxId", entry.ID, "taskId", entry.TaskID, "error", err)
-					continue
-				}
-				metrics.OutboxRelayed.WithLabelValues(entry.QueueName).Inc()
-				slog.Info("outbox relay delivered task to Redis", "taskId", entry.TaskID)
-			}
-		}
-	}
-}
-
-// runJanitor periodically checks for tasks that have been inflight longer than holdTTL and moves them back to the main queue for retry.
-func runJanitor(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, jobRepo *repository.JobRepository, wg *sync.WaitGroup) {
-	defer wg.Done()
-	slog.Info("janitor thread started, monitoring for abandoned tasks...")
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("janitor thread received shutdown signal, exiting...")
-			return
-		case <-ticker.C:
-			reclaimed, err := store.FindAbandonedTasks(ctx, queueName)
-			if err != nil {
-				slog.Error("failed to sweep abandoned tasks", "error", err)
-				continue
-			}
-			for _, taskID := range reclaimed {
-				action, err := jobRepo.RecoverExpiredJob(ctx, queueName, taskID)
-				if err != nil {
-					slog.Error("failed to inspect expired job lease", "taskId", taskID, "error", err)
-					continue
-				}
-				switch action {
-				case repository.RecoveryKeepInflight:
-					// The worker is alive and renewing its lease. The original
-					// Redis timestamp may be old, but it is not a recovery signal.
-					continue
-				case repository.RecoveryAcknowledge:
-					slog.Info("abandoned Redis entry belongs to a terminal or missing job, acknowledging it", "taskId", taskID)
-					if err := store.AcknowledgeTask(ctx, queueName, taskID); err != nil {
-						slog.Error("failed to remove terminal abandoned task from Redis", "taskId", taskID, "error", err)
-					}
-					continue
-				case repository.RecoveryRequeue:
-					// Continue below.
-				}
-				moved, err := store.RequeueAbandonedTask(ctx, queueName, taskID)
-				if err != nil {
-					slog.Error("failed to requeue abandoned Redis task", "taskId", taskID, "error", err)
-					continue
-				}
-				if !moved {
-					slog.Info("abandoned task was already removed from Redis inflight", "taskId", taskID)
-				}
-			}
-			slog.Info("janitor sweep completed", "reclaimed", len(reclaimed))
-		}
-	}
-}
-
-// runDelayedPoller periodically checks the delayed queue for tasks whose delay has expired and moves them to the main queue.
-func runDelayedPoller(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
-	defer wg.Done()
-	slog.Info("delayed-task poller started")
-
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("delayed-task poller received shutdown signal, exiting...")
-			return
-		case <-ticker.C:
-			if err := store.PolledDelayedTasks(ctx, queueName); err != nil {
-				slog.Error("failed to poll delayed tasks", "error", err)
-			}
-		}
-	}
-}
-
-// runDepthCollector periodically snapshots queue/inflight/delayed/DLQ sizes
-// into Prometheus gauges.
 func runDepthCollector(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
 	defer wg.Done()
-	slog.Info("depth collector started")
-
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
-			slog.Info("depth collector received shutdown signal, exiting...")
 			return
 		case <-ticker.C:
 			if err := store.CollectDepths(ctx, queueName); err != nil {
-				slog.Error("failed to collect queue depths", "error", err)
+				slog.Warn("collect queue depths", "error", err)
 			}
 		}
 	}
 }
 
-// runMetricsServer serves Prometheus metrics on metricsAddr until ctx is
-// cancelled, then shuts the HTTP server down gracefully.
-func runMetricsServer(ctx context.Context, metricsAddr string, wg *sync.WaitGroup) {
+func runMetricsServer(ctx context.Context, address string, wg *sync.WaitGroup) {
 	defer wg.Done()
-
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-
-	// Health check endpoint for load balancers
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusOK)
-		w.Write([]byte(`{"status":"healthy","service":"distributed-queue"}`))
+		_, _ = w.Write([]byte(`{"status":"healthy","service":"distributed-queue"}`))
 	})
-
-	srv := &http.Server{Addr: metricsAddr, Handler: mux}
-
-	serverErr := make(chan error, 1)
+	server := &http.Server{Addr: address, Handler: mux}
 	go func() {
-		slog.Info("metrics server starting", "addr", metricsAddr)
-		err := srv.ListenAndServe()
-		if err != nil && err != http.ErrServerClosed {
-			slog.Error("metrics server failed to start", "error", err, "addr", metricsAddr)
+		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			slog.Error("metrics server", "error", err)
 		}
-		serverErr <- err
 	}()
-
-	select {
-	case <-ctx.Done():
-		slog.Info("metrics server received shutdown signal, shutting down...")
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			slog.Error("metrics server shutdown error", "error", err)
-		}
-	case err := <-serverErr:
-		if err != nil && err != http.ErrServerClosed {
-			slog.Error("metrics server failed", "error", err)
-		}
-	}
+	<-ctx.Done()
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = server.Shutdown(shutdownCtx)
 }
 
 func main() {
-	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	slog.SetDefault(logger)
-
+	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)))
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("failed to load configuration", "error", err)
+		slog.Error("load config", "error", err)
 		return
 	}
-
-	// Retry Redis connection with exponential backoff
-	var store *redis.RedisStore
-	maxRetries := 5
-	for i := 0; i < maxRetries; i++ {
-		store, err = redis.NewRedisStore(ctx, cfg.Redis, cfg.Queue.HoldTTL)
-		if err == nil {
-			break
-		}
-
-		if i < maxRetries-1 {
-			backoff := time.Duration(1<<uint(i)) * time.Second
-			slog.Warn("failed to connect to Redis, retrying...", "attempt", i+1, "backoff", backoff, "error", err)
-			time.Sleep(backoff)
-		} else {
-			slog.Error("failed to initialize Redis store after retries", "error", err)
-			return
-		}
-	}
-
-	pgCfg := repository.PostgresConfig{ConnString: cfg.Postgres.ConnString}
-
-	// Run migrations before opening the pool — if migrations fail, don't start
-	slog.Info("running database migrations...")
-	if err := repository.RunMigrations(cfg.Postgres.ConnString, "file://db/migrations"); err != nil {
-		slog.Error("database migration failed, cannot start", "error", err)
-		store.Close()
-		return
-	}
-
-	pgPool, err := repository.NewPostgresPool(ctx, pgCfg)
+	store, err := redis.NewRedisStore(ctx, cfg.Redis, cfg.Queue.HoldTTL)
 	if err != nil {
-		slog.Error("failed to initialize PostgreSQL connection pool", "error", err)
-		store.Close()
+		slog.Error("connect Redis", "error", err)
 		return
 	}
-
-	jobRepo := repository.NewJobRepository(pgPool)
-
-	// Create circuit breaker for DB operations
-	// Opens after 5 failures, resets after 30 seconds
-	dbBreaker := circuitbreaker.New(5, 30*time.Second)
-
-	defer func() {
-		slog.Info("shutting down, closing database connections...")
-		pgPool.Close()
-		store.Close()
-	}()
-
+	defer store.Close()
+	if err := repository.RunMigrations(cfg.Postgres.ConnString, "file://db/migrations"); err != nil {
+		slog.Error("run migrations", "error", err)
+		return
+	}
+	pool, err := repository.NewPostgresPool(ctx, repository.PostgresConfig{ConnString: cfg.Postgres.ConnString})
+	if err != nil {
+		slog.Error("connect Postgres", "error", err)
+		return
+	}
+	defer pool.Close()
+	if err := store.EnsureConsumerGroup(ctx, cfg.Queue.Name); err != nil {
+		slog.Error("initialize stream group", "error", err)
+		return
+	}
+	jobs := repository.NewJobRepository(pool)
+	breaker := circuitbreaker.New(5, 30*time.Second)
 	var wg sync.WaitGroup
-	wg.Add(7)
-	go runWorker(ctx, cfg.Queue.Name, cfg.Queue.HoldTTL, store, jobRepo, dbBreaker, &wg)
-	go runProducer(ctx, cfg.Queue.Name, cfg.Queue.TaskProducerInterval, store, jobRepo, dbBreaker, &wg)
-	go runOutboxRelay(ctx, 2*time.Second, store, jobRepo, &wg)
-	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, store, jobRepo, &wg)
-	go runDelayedPoller(ctx, cfg.Queue.Name, cfg.Queue.DelayedPollEvery, store, &wg)
+	workerCount := cfg.Worker.Count
+	wg.Add(workerCount + 5)
+	for i := 0; i < workerCount; i++ {
+		go runWorker(ctx, cfg.Queue.Name, fmt.Sprintf("worker-%s-%d", uuid.NewString(), i), cfg.Queue.HoldTTL, store, jobs, breaker, &wg)
+	}
+	go runProducer(ctx, cfg.Queue.Name, cfg.Queue.TaskProducerInterval, jobs, breaker, &wg)
+	go runOutboxRelay(ctx, time.Second, cfg.Queue.HoldTTL, store, jobs, &wg)
+	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, cfg.Queue.HoldTTL, store, jobs, &wg)
 	go runDepthCollector(ctx, cfg.Queue.Name, cfg.Queue.DepthPollEvery, store, &wg)
 	go runMetricsServer(ctx, cfg.Metrics.Addr, &wg)
-
 	<-ctx.Done()
-	slog.Info("shutdown signal received, waiting for all threads to exit...")
-
-	// Graceful shutdown with timeout
 	done := make(chan struct{})
-
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-done:
-		slog.Info("all threads exited gracefully")
 	case <-time.After(cfg.Worker.ShutdownTimeout):
-		slog.Warn("shutdown timeout reached, forcing exit", "timeout", cfg.Worker.ShutdownTimeout)
-		// Note: In-flight tasks will be recovered by janitor on next startup
+		slog.Warn("shutdown timeout reached")
 	}
-
-	slog.Info("shutdown complete")
 }

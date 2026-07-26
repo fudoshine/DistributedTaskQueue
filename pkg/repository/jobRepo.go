@@ -20,6 +20,8 @@ var (
 	ErrJobNotReady     = errors.New("job execution skipped: not queued or dependencies are incomplete")
 	ErrTerminalJob     = errors.New("job execution skipped: job is terminal")
 	ErrLeaseLost       = errors.New("job execution skipped: lease is no longer owned by this attempt")
+	ErrStaleDelivery   = errors.New("job execution skipped: delivery is no longer current")
+	ErrRelayLeaseLost  = errors.New("outbox relay no longer owns this delivery")
 	// ErrJobNotFound means TryStartJob was called for a taskID with no
 	// corresponding processed_jobs row. Under this system's design that
 	// should never happen — every task is created in Postgres via CreateJob
@@ -63,6 +65,17 @@ type JobRepository struct {
 type JobClaim struct {
 	LeaseToken uuid.UUID
 	Attempt    int
+}
+
+// Delivery is an immutable publication request held in Postgres until the
+// relay has appended it to the broker. Generation distinguishes retries and
+// recovery from earlier messages for the same logical job.
+type Delivery struct {
+	OutboxID   uuid.UUID
+	TaskID     uuid.UUID
+	DeliveryID uuid.UUID
+	Generation int
+	QueueName  string
 }
 
 type RecoveryAction int
@@ -156,11 +169,7 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 		// Root task (no parents) — write outbox row in the same transaction.
 		// The outbox relay will enqueue this to Redis. This guarantees atomicity:
 		// either both processed_jobs and outbox land, or neither does.
-		outboxQuery := `
-			INSERT INTO outbox (task_id, queue_name, delivered)
-			VALUES ($1, $2, FALSE);
-		`
-		_, err = tx.Exec(ctx, outboxQuery, task.ID, queueName)
+		_, err = insertDelivery(ctx, tx, task.ID, queueName, 0, time.Now())
 		if err != nil {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "CreateJob").Inc()
 			return fmt.Errorf("failed to write outbox row for task %s: %w", task.ID, err)
@@ -178,11 +187,15 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 // TryStartJob atomically claims an eligible job. QUEUED is the only claimable
 // state. The dependency predicate is checked at claim time as a final guard
 // against stale or externally injected Redis messages.
-func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID string, leaseTTL time.Duration) (JobClaim, error) {
+func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID, deliveryID string, generation int, leaseTTL time.Duration) (JobClaim, error) {
 	id, err := uuid.Parse(taskID)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
 		return JobClaim{}, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
+	}
+	parsedDeliveryID, err := uuid.Parse(deliveryID)
+	if err != nil {
+		return JobClaim{}, fmt.Errorf("deliveryID %q is not a valid UUID: %w", deliveryID, err)
 	}
 	if leaseTTL <= 0 {
 		return JobClaim{}, fmt.Errorf("lease TTL must be positive")
@@ -204,6 +217,13 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID strin
 		    attempt_number = attempt_number + 1
 		WHERE job.id = $1
 		  AND job.status = $5
+		  AND job.delivery_generation = $7
+		  AND EXISTS (
+			  SELECT 1 FROM outbox delivery
+			  WHERE delivery.task_id = job.id
+			    AND delivery.generation = $7
+			    AND delivery.delivery_id = $8
+		  )
 		  AND job.available_at <= NOW()
 		  AND NOT EXISTS (
 			  SELECT 1
@@ -214,7 +234,7 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID strin
 		  )
 		RETURNING lease_token, attempt_number;
 		`
-	err = tx.QueryRow(ctx, query, id, StatusRunning, claim.LeaseToken, leaseTTL.String(), StatusQueued, StatusCompleted).Scan(&claim.LeaseToken, &claim.Attempt)
+	err = tx.QueryRow(ctx, query, id, StatusRunning, claim.LeaseToken, leaseTTL.String(), StatusQueued, StatusCompleted, generation, parsedDeliveryID).Scan(&claim.LeaseToken, &claim.Attempt)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
@@ -222,10 +242,14 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID strin
 		}
 
 		var status string
-		err = tx.QueryRow(ctx, `SELECT status FROM processed_jobs WHERE id = $1;`, id).Scan(&status)
+		var currentGeneration int
+		err = tx.QueryRow(ctx, `SELECT status, delivery_generation FROM processed_jobs WHERE id = $1;`, id).Scan(&status, &currentGeneration)
 		if errors.Is(err, pgx.ErrNoRows) {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
 			return JobClaim{}, ErrJobNotFound
+		}
+		if currentGeneration != generation {
+			return JobClaim{}, ErrStaleDelivery
 		}
 		if err != nil {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
@@ -265,6 +289,12 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 		return 0, 0, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, parseErr)
 	}
 
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin failure transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
 	query := `
 		UPDATE processed_jobs
 		SET current_retries = current_retries + 1,
@@ -278,14 +308,21 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 				ELSE NOW() + make_interval(secs => ((1::bigint << (current_retries + 1))::double precision))
 			END,
 			lease_token = NULL,
-			lease_expires_at = NULL
+			lease_expires_at = NULL,
+			delivery_generation = CASE
+				WHEN current_retries + 1 >= max_retries THEN delivery_generation
+				ELSE delivery_generation + 1
+			END
 		WHERE id = $1
 		  AND status = $5
 		  AND lease_token = $6
 		  AND lease_expires_at > NOW()
-		RETURNING current_retries, max_retries;
+		RETURNING current_retries, max_retries, status, delivery_generation, available_at;
 	`
-	err = r.pool.QueryRow(ctx, query, id, errLog, StatusFailed, StatusQueued, StatusRunning, leaseToken).Scan(&currentRetries, &maxRetries)
+	var status string
+	var generation int
+	var availableAt time.Time
+	err = tx.QueryRow(ctx, query, id, errLog, StatusFailed, StatusQueued, StatusRunning, leaseToken).Scan(&currentRetries, &maxRetries, &status, &generation, &availableAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, 0, ErrLeaseLost
@@ -293,10 +330,28 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 		metrics.JobRepoErrors.WithLabelValues(queueName, "RecordFailure").Inc()
 		return 0, 0, fmt.Errorf("failed to record failure for task %s: %w", taskID, err)
 	}
+	if status == StatusQueued {
+		if _, err := insertDelivery(ctx, tx, id, queueName, generation, availableAt); err != nil {
+			return 0, 0, fmt.Errorf("schedule retry delivery: %w", err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, 0, fmt.Errorf("commit failure transaction: %w", err)
+	}
 	if currentRetries >= maxRetries {
 		metrics.JobsFailedTerminal.WithLabelValues(queueName).Inc()
 	}
 	return currentRetries, maxRetries, nil
+}
+
+func insertDelivery(ctx context.Context, tx pgx.Tx, taskID uuid.UUID, queueName string, generation int, notBefore time.Time) (Delivery, error) {
+	delivery := Delivery{DeliveryID: uuid.New(), TaskID: taskID, QueueName: queueName, Generation: generation}
+	err := tx.QueryRow(ctx, `
+		INSERT INTO outbox (task_id, queue_name, delivery_id, generation, not_before, delivered)
+		VALUES ($1, $2, $3, $4, $5, FALSE)
+		RETURNING id;
+	`, taskID, queueName, delivery.DeliveryID, generation, notBefore).Scan(&delivery.OutboxID)
+	return delivery, err
 }
 
 // RenewLease extends an active attempt using the database clock. It returns
@@ -445,9 +500,9 @@ func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queu
 			WHERE child.id = ready.id AND child.status = $2
 			RETURNING child.id
 		)
-		INSERT INTO outbox (task_id, queue_name, delivered)
-		SELECT id, $5, FALSE FROM promoted_children
-		ON CONFLICT (task_id) DO NOTHING
+		INSERT INTO outbox (task_id, queue_name, delivery_id, generation, not_before, delivered)
+		SELECT id, $5, uuid_generate_v4(), 0, NOW(), FALSE FROM promoted_children
+		ON CONFLICT (task_id, generation) DO NOTHING
 		RETURNING task_id;
 	`, id, StatusPending, StatusCompleted, StatusQueued, queueName)
 	if err != nil {
@@ -615,53 +670,164 @@ func (r *JobRepository) UpdateWorkflowStatus(ctx context.Context, workflowID uui
 	return nil
 }
 
-// OutboxEntry represents a single undelivered row from the outbox table.
-type OutboxEntry struct {
-	ID        uuid.UUID
-	TaskID    uuid.UUID
-	QueueName string
-}
-
-// GetPendingOutbox returns all undelivered outbox rows ordered by creation time.
-// The relay calls this on every tick and enqueues each task to Redis.
-func (r *JobRepository) GetPendingOutbox(ctx context.Context) ([]OutboxEntry, error) {
-	query := `
-		SELECT id, task_id, queue_name
-		FROM outbox
-		WHERE delivered = FALSE
-		ORDER BY created_at ASC;
-	`
-	rows, err := r.pool.Query(ctx, query)
+// ClaimPendingOutbox leases due rows so multiple relay replicas never publish
+// the same row concurrently. A relay crash merely lets the short lease expire;
+// a repeated publication is safe because the delivery ID is immutable.
+func (r *JobRepository) ClaimPendingOutbox(ctx context.Context, limit int, leaseTTL time.Duration) ([]Delivery, uuid.UUID, error) {
+	if limit < 1 || leaseTTL <= 0 {
+		return nil, uuid.Nil, fmt.Errorf("invalid outbox claim limit or lease TTL")
+	}
+	token := uuid.New()
+	rows, err := r.pool.Query(ctx, `
+		WITH due AS (
+			SELECT id FROM outbox
+			WHERE delivered = FALSE
+			  AND not_before <= NOW()
+			  AND (relay_lease_expires_at IS NULL OR relay_lease_expires_at <= NOW())
+			ORDER BY not_before, created_at
+			FOR UPDATE SKIP LOCKED
+			LIMIT $1
+		)
+		UPDATE outbox entry
+		SET relay_lease_token = $2,
+		    relay_lease_expires_at = NOW() + $3::interval
+		FROM due
+		WHERE entry.id = due.id
+		RETURNING entry.id, entry.task_id, entry.delivery_id, entry.generation, entry.queue_name;
+	`, limit, token, leaseTTL.String())
 	if err != nil {
-		return nil, fmt.Errorf("failed to query pending outbox: %w", err)
+		return nil, uuid.Nil, fmt.Errorf("claim due outbox rows: %w", err)
 	}
 	defer rows.Close()
-
-	var entries []OutboxEntry
+	entries := make([]Delivery, 0)
 	for rows.Next() {
-		var e OutboxEntry
-		if err := rows.Scan(&e.ID, &e.TaskID, &e.QueueName); err != nil {
-			return nil, fmt.Errorf("failed to scan outbox row: %w", err)
+		var entry Delivery
+		if err := rows.Scan(&entry.OutboxID, &entry.TaskID, &entry.DeliveryID, &entry.Generation, &entry.QueueName); err != nil {
+			return nil, uuid.Nil, fmt.Errorf("scan claimed outbox row: %w", err)
 		}
-		entries = append(entries, e)
+		entries = append(entries, entry)
+	}
+	return entries, token, rows.Err()
+}
+
+func (r *JobRepository) MarkOutboxDelivered(ctx context.Context, outboxID, relayToken uuid.UUID) error {
+	tag, err := r.pool.Exec(ctx, `
+		UPDATE outbox
+		SET delivered = TRUE, delivered_at = NOW(), relay_lease_token = NULL, relay_lease_expires_at = NULL
+		WHERE id = $1 AND delivered = FALSE AND relay_lease_token = $2;
+	`, outboxID, relayToken)
+	if err != nil {
+		return fmt.Errorf("mark outbox row %s delivered: %w", outboxID, err)
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrRelayLeaseLost
+	}
+	return nil
+}
+
+func (r *JobRepository) ReleaseOutboxLease(ctx context.Context, outboxID, relayToken uuid.UUID) error {
+	_, err := r.pool.Exec(ctx, `
+		UPDATE outbox SET relay_lease_token = NULL, relay_lease_expires_at = NULL
+		WHERE id = $1 AND delivered = FALSE AND relay_lease_token = $2;
+	`, outboxID, relayToken)
+	return err
+}
+
+// RecoverExpiredLeases durably schedules a new delivery generation for every
+// expired running attempt. It does not depend on Redis pending state, so a
+// broker outage or a lost old PEL entry cannot strand a RUNNING job.
+func (r *JobRepository) RecoverExpiredLeases(ctx context.Context, queueName string, limit int) ([]Delivery, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("recovery limit must be positive")
+	}
+	rows, err := r.pool.Query(ctx, `
+		WITH expired AS (
+			SELECT id, delivery_generation + 1 AS next_generation
+			FROM processed_jobs
+			WHERE status = $1 AND lease_expires_at <= NOW()
+			ORDER BY lease_expires_at
+			FOR UPDATE SKIP LOCKED
+			LIMIT $2
+		), recovered AS (
+			UPDATE processed_jobs job
+			SET status = $3, available_at = NOW(), lease_token = NULL, lease_expires_at = NULL,
+			    delivery_generation = expired.next_generation
+			FROM expired WHERE job.id = expired.id
+			RETURNING job.id, job.delivery_generation
+		), published AS (
+			INSERT INTO outbox (task_id, queue_name, delivery_id, generation, not_before, delivered)
+			SELECT id, $4, uuid_generate_v4(), delivery_generation, NOW(), FALSE FROM recovered
+			RETURNING id, task_id, delivery_id, generation, queue_name
+		)
+		SELECT id, task_id, delivery_id, generation, queue_name FROM published;
+	`, StatusRunning, limit, StatusQueued, queueName)
+	if err != nil {
+		return nil, fmt.Errorf("recover expired leases: %w", err)
+	}
+	defer rows.Close()
+	entries := make([]Delivery, 0)
+	for rows.Next() {
+		var entry Delivery
+		if err := rows.Scan(&entry.OutboxID, &entry.TaskID, &entry.DeliveryID, &entry.Generation, &entry.QueueName); err != nil {
+			return nil, fmt.Errorf("scan recovered delivery: %w", err)
+		}
+		entries = append(entries, entry)
 	}
 	return entries, rows.Err()
 }
 
-// MarkOutboxDelivered marks an outbox row as delivered after the task has been
-// successfully enqueued to Redis. Called by the outbox relay.
-func (r *JobRepository) MarkOutboxDelivered(ctx context.Context, outboxID uuid.UUID) error {
-	query := `
-		UPDATE outbox
-		SET delivered = TRUE,
-		    delivered_at = NOW()
-		WHERE id = $1;
-	`
-	_, err := r.pool.Exec(ctx, query, outboxID)
+// RecoverIdleDelivery handles a PEL entry whose consumer stopped before it
+// claimed the job. Running jobs with a live DB lease remain untouched; all
+// other current queued deliveries get a new durable generation before the old
+// Stream entry is acknowledged.
+func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, taskID string, generation int) (RecoveryAction, error) {
+	id, err := uuid.Parse(taskID)
 	if err != nil {
-		return fmt.Errorf("failed to mark outbox row %s as delivered: %w", outboxID, err)
+		return RecoveryAcknowledge, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
 	}
-	return nil
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return RecoveryKeepInflight, fmt.Errorf("begin idle-delivery recovery: %w", err)
+	}
+	defer tx.Rollback(ctx)
+	var status string
+	var currentGeneration int
+	var availableAt time.Time
+	var leaseExpiresAt *time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT status, delivery_generation, available_at, lease_expires_at
+		FROM processed_jobs WHERE id = $1 FOR UPDATE;
+	`, id).Scan(&status, &currentGeneration, &availableAt, &leaseExpiresAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return RecoveryAcknowledge, nil
+	}
+	if err != nil {
+		return RecoveryKeepInflight, fmt.Errorf("inspect idle delivery: %w", err)
+	}
+	if status == StatusRunning && leaseExpiresAt != nil && leaseExpiresAt.After(time.Now()) {
+		return RecoveryKeepInflight, nil
+	}
+	if currentGeneration != generation || status == StatusCompleted || status == StatusFailed || status == StatusCancelled || status == StatusPending {
+		return RecoveryAcknowledge, nil
+	}
+	if status != StatusQueued && status != StatusRunning {
+		return RecoveryAcknowledge, nil
+	}
+	nextGeneration := currentGeneration + 1
+	if _, err := tx.Exec(ctx, `
+		UPDATE processed_jobs
+		SET status = $2, lease_token = NULL, lease_expires_at = NULL, delivery_generation = $3
+		WHERE id = $1;
+	`, id, StatusQueued, nextGeneration); err != nil {
+		return RecoveryKeepInflight, fmt.Errorf("reset idle delivery: %w", err)
+	}
+	if _, err := insertDelivery(ctx, tx, id, queueName, nextGeneration, availableAt); err != nil {
+		return RecoveryKeepInflight, fmt.Errorf("schedule recovered delivery: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return RecoveryKeepInflight, fmt.Errorf("commit idle-delivery recovery: %w", err)
+	}
+	return RecoveryRequeue, nil
 }
 
 // GetStuckPendingJobs returns task IDs that have been sitting in PENDING status

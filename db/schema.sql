@@ -21,7 +21,12 @@ CREATE TABLE processed_jobs (
     task_details JSONB NOT NULL,
     error_log TEXT,
     processed_at TIMESTAMP WITH TIME ZONE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    available_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    lease_token UUID,
+    lease_expires_at TIMESTAMP WITH TIME ZONE,
+    attempt_number INT NOT NULL DEFAULT 0,
+    delivery_generation INT NOT NULL DEFAULT 0
 );
 
 -- 3. Job Dependencies Junction Table (DAG edges)
@@ -47,10 +52,16 @@ CREATE TABLE outbox (
     id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     task_id     UUID NOT NULL REFERENCES processed_jobs(id) ON DELETE CASCADE,
     queue_name  VARCHAR(255) NOT NULL,
+    delivery_id UUID NOT NULL DEFAULT uuid_generate_v4(),
+    generation INT NOT NULL DEFAULT 0,
+    not_before TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
     delivered   BOOLEAN NOT NULL DEFAULT FALSE,
     created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    delivered_at TIMESTAMP WITH TIME ZONE
+    delivered_at TIMESTAMP WITH TIME ZONE,
+    relay_lease_token UUID,
+    relay_lease_expires_at TIMESTAMP WITH TIME ZONE
 );
 
-CREATE INDEX idx_outbox_undelivered ON outbox(delivered, created_at)
+CREATE UNIQUE INDEX outbox_task_generation_unique ON outbox(task_id, generation);
+CREATE INDEX idx_outbox_undelivered ON outbox(delivered, not_before, created_at)
     WHERE delivered = FALSE;

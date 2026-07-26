@@ -21,6 +21,10 @@ services:
   redis:
     image: redis:7-alpine
     container_name: queue-redis
+    # The relay marks an outbox row delivered only after XADD returns. Require
+    # Redis to fsync that append before returning so a host crash cannot lose a
+    # delivery that Postgres has already marked as published.
+    command: ["redis-server", "--appendonly", "yes", "--appendfsync", "always"]
     ports:
       - "6379:6379"
     volumes:
