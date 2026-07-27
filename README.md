@@ -39,6 +39,27 @@ Tasks with unmet dependencies stay in Postgres as `PENDING`. A worker completing
 
 ---
 
+## Prerequisites
+
+- Go 1.25.6 (or compatible with `go.mod`)
+- Docker & Docker Compose
+- PostgreSQL client (`psql`)
+
+---
+
+## Configuration
+
+Copy `.env.example` to `.env` and adjust values for your environment.
+
+| Variable | Purpose | Example |
+|----------|---------|---------|
+| `POSTGRES_CONN_STRING` | PostgreSQL connection string used by the app | `******localhost:5432/task_queue?sslmode=disable` |
+| `REDIS_ADDRESS` | Redis host and port | `localhost:6379` |
+| `QUEUE_NAME` | Redis queue key/prefix for tasks | `queue:video_processing` |
+| `METRICS_ADDR` | HTTP bind address for health/metrics | `:9090` |
+
+---
+
 ## Quick Start
 
 ```bash
@@ -46,13 +67,19 @@ Tasks with unmet dependencies stay in Postgres as `PENDING`. A worker completing
 docker-compose up -d
 
 # Apply schema
+# use the same PostgreSQL connection value you configure in .env (POSTGRES_CONN_STRING)
 psql "postgres://postgres:password@localhost:5432/task_queue?sslmode=disable" < db/schema.sql
 
 # Copy and configure env
 cp .env.example .env
 
-# Build and run
+# Build
 go build -o distributed-queue .
+
+# Run tests
+go test ./...
+
+# Run
 ./distributed-queue
 ```
 
@@ -154,6 +181,14 @@ This was built from scratch to deeply understand distributed systems internals â
 | [docs/METRICS_COMPLETE.md](docs/METRICS_COMPLETE.md) | All metrics with Grafana query examples |
 | [docs/ATOMIC_DAG_ORCHESTRATION.md](docs/ATOMIC_DAG_ORCHESTRATION.md) | Write-ahead log and atomic child enqueue |
 | [docs/GRACEFUL_SHUTDOWN.md](docs/GRACEFUL_SHUTDOWN.md) | Shutdown sequence and timeout behavior |
+
+---
+
+## Production Notes
+
+- Configuration and tuning guidance: [docs/configuration.md](docs/configuration.md)
+- Operational debugging and recovery: [docs/troubleshooting.md](docs/troubleshooting.md)
+- Architecture and scaling decisions: [docs/architecture.md](docs/architecture.md)
 
 ---
 
