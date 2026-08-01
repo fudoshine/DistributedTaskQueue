@@ -126,7 +126,7 @@
       "targets": [
         {
           "expr": "pgxpool_acquired_conns",
-          "legendFormat": "acquired"
+          "legendFormat": "in use now"
         },
         {
           "expr": "pgxpool_max_conns",
@@ -147,7 +147,8 @@
           "expr": "rate(pgxpool_acquire_duration_seconds_total[5m]) / rate(pgxpool_acquire_total[5m])",
           "legendFormat": "avg acquire wait"
         }
-      ]
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] }
     },
     {
       "title": "Postgres Pool Canceled Acquires",
@@ -161,13 +162,13 @@
       ]
     },
     {
-      "title": "Postgres Pool Connection Churn",
+      "title": "Postgres Pool Acquires",
       "type": "timeseries",
       "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
       "targets": [
         {
-          "expr": "rate(pgxpool_new_conns_total[5m])",
-          "legendFormat": "new conns/s"
+          "expr": "rate(pgxpool_acquire_total[5m])",
+          "legendFormat": "acquires/s"
         }
       ]
     }

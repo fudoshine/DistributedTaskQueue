@@ -127,7 +127,7 @@ continue  // Leave parent in RUNNING state
 
 1. **Idempotent Enqueue**: `EnqueueTask()` is safe to call multiple times
 2. **Parent Stays Claimable**: If children fail to enqueue, parent remains `RUNNING`
-3. **Janitor Recovery**: Parent stays in Redis `:inflight`, janitor will retry after timeout
+3. **Janitor Recovery**: The unacknowledged Redis Stream entry stays in the consumer group's pending-entry list and is recovered after the lease timeout
 4. **All-or-Nothing**: Either ALL children enqueue + parent completes, or NOTHING changes
 
 ### **Trade-off:**

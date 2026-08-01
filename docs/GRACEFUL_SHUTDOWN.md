@@ -47,8 +47,8 @@ SHUTDOWN_TIMEOUT=30s
 10:00:00 - Worker stuck on long task
 10:00:30 - Shutdown timeout reached!
 10:00:30 - Force exit ⚠️
-10:00:30 - Task left in Redis :inflight
-10:00:50 - Janitor recovers task (after HoldTTL)
+10:00:30 - Stream entry remains pending (not XACKed)
+10:00:50 - Janitor examines the idle pending entry and DB lease
 ```
 
 ---
@@ -61,7 +61,7 @@ SHUTDOWN_TIMEOUT=30s
 ✅ Tasks finishing within timeout - Complete normally
 
 ### **Not Protected:**
-⚠️ Tasks mid-processing at timeout - Recovered by janitor
+⚠️ Tasks mid-processing at timeout - Recovered through Redis Streams PEL and the PostgreSQL lease
 
 ---
 
@@ -100,4 +100,4 @@ SHUTDOWN_TIMEOUT=30s
 
 ## 🎯 **Summary**
 
-Workers finish current tasks (up to 30s), then exit. If timeout reached, force exit and janitor recovers abandoned tasks. Zero data loss due to idempotency!
+Workers finish current tasks (up to 30s), then exit. If timeout is reached, the delivery stays unacknowledged in the consumer group's pending-entry list; the janitor recovers it using the PostgreSQL lease state.

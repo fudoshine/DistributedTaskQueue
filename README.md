@@ -1,38 +1,18 @@
 # Distributed Task Queue
 
-A production-ready task queue in Go with DAG workflow orchestration — tasks declare parent dependencies and only execute once all parents complete. Failures cascade: if a parent fails, all descendants are automatically cancelled. Built on Redis for queueing and PostgreSQL for durable state.
+A production-ready task queue in Go with DAG workflow orchestration — tasks declare parent dependencies and only execute once all parents complete. Failures cascade: if a parent fails, all descendants are automatically cancelled. Built on Redis Streams consumer groups for queueing and PostgreSQL for durable state.
 
 ---
 
 ## How It Works
 
-```
-                      ┌─────────────────────────────┐
-                      │        Your Workflow         │
-                      │                              │
-                      │   [Upload] ──▶ [Transcode]   │
-                      │                    │         │
-                      │                    ▼         │
-                      │              [Thumbnail]     │
-                      │                    │         │
-                      │                    ▼         │
-                      │               [Notify]       │
-                      └─────────────────────────────┘
-                                     │
-              ┌──────────────────────┼──────────────────────┐
-              ▼                      ▼                      ▼
-       ┌─────────────┐       ┌─────────────┐       ┌─────────────┐
-       │   Producer  │       │    Redis    │       │   Worker    │
-       │             │──────▶│    Queue    │──────▶│   (x N)     │
-       │ Creates DAG │       │             │       │             │
-       └─────────────┘       └─────────────┘       └──────┬──────┘
-                                                          │
-                                                          ▼
-                                                  ┌─────────────┐
-                                                  │  PostgreSQL │
-                                                  │  Job State  │
-                                                  │  + DAG Deps │
-                                                  └─────────────┘
+```mermaid
+flowchart LR
+    producer[Producer] -->|writes jobs + outbox| postgres[(PostgreSQL<br/>jobs, DAG dependencies, outbox)]
+    postgres -->|outbox relay| streams[Redis Streams<br/>consumer group]
+    streams -->|XREADGROUP| worker[Workers]
+    worker -->|claim, complete, or fail| postgres
+    postgres -->|ready child delivery| streams
 ```
 
 Tasks with unmet dependencies stay in Postgres as `PENDING`. A worker completing a parent automatically enqueues its children — you never manage execution order manually.
@@ -61,6 +41,12 @@ Check it's running:
 curl http://localhost:9090/health
 # {"status":"healthy","service":"distributed-queue"}
 ```
+
+## Observability
+
+Prometheus is available at `http://localhost:9091` and Grafana at `http://localhost:3000` (`admin` / `admin`). The dashboard includes queue throughput, workflow state, failures, and PostgreSQL pool activity: connections in use, idle connections, acquisition rate, and acquisition latency.
+
+![Grafana dashboard](docs/images/grafana-dashboard.png)
 
 Expected output when running:
 ```
@@ -113,11 +99,13 @@ store.EnqueueTask(ctx, queueName, upload.ID.String())
 - **DAG Workflows** — multi-parent task dependencies via junction table
 - **Idempotency** — CAS pattern prevents duplicate processing
 - **Circuit Breaker** — fast-fail when database is down
-- **Cascading Cancellation** — parent failure cancels all descendants
+- **Cascading Cancellation** — cycle-safe recursive PostgreSQL query cancels all descendants on parent failure
 - **Graceful Shutdown** — waits for in-flight tasks before exit
 - **Retry + DLQ** — exponential backoff, dead letter queue for permanent failures
 - **Orphan Recovery** — transactional outbox guarantees at-least-once delivery to Redis even across server crashes
-- **Prometheus Metrics** — all critical paths instrumented
+- **Redis Streams Delivery** — consumer groups, acknowledgements, heartbeats, and idle-delivery recovery
+- **Prometheus + Grafana** — queue metrics and PostgreSQL pool connections, acquire rate, and wait latency
+- **Configurable PostgreSQL Pool** — connection limits, idle timeout, lifetime, and jitter are environment-configurable
 
 ---
 
@@ -130,9 +118,10 @@ This was built from scratch to deeply understand distributed systems internals �
 ## Tech Stack
 
 - **Go 1.25.6** — application runtime
-- **Redis 7** — task queue and inflight tracking
+- **Redis 7 Streams** — consumer-group queue, pending-entry tracking, and recovery
 - **PostgreSQL 14+** — durable job state and DAG dependencies
 - **Prometheus** — metrics and observability
+- **Grafana** — dashboard visualization
 
 ---
 
