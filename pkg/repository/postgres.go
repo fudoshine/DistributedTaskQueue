@@ -2,6 +2,8 @@ package repository
 
 import (
 	"context"
+	"distributed-queue/pkg/config"
+	"distributed-queue/pkg/repository/metrics"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -10,11 +12,8 @@ import (
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
 	_ "github.com/golang-migrate/migrate/v4/source/file"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/prometheus/client_golang/prometheus"
 )
-
-type PostgresConfig struct {
-	ConnString string // e.g., "postgres://user:pass@localhost:5432/dbname"
-}
 
 // RunMigrations applies all pending up migrations from db/migrations/.
 // Called once on startup before the pool is used.
@@ -36,8 +35,17 @@ func RunMigrations(connString, migrationsPath string) error {
 }
 
 // NewPostgresPool establishes a high-performance thread-safe connection pool.
-func NewPostgresPool(ctx context.Context, cfg PostgresConfig) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, cfg.ConnString)
+func NewPostgresPool(ctx context.Context, cfg config.PostgresConfig) (*pgxpool.Pool, error) {
+	pgxCfg, err := pgxpool.ParseConfig(cfg.ConnString)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse pgx config: %w", err)
+	}
+	pgxCfg.MaxConns = int32(cfg.MaxConns)
+	pgxCfg.MinConns = int32(cfg.MinConns)
+	pgxCfg.MaxConnLifetime = cfg.MaxConnLifetime
+	pgxCfg.MaxConnIdleTime = cfg.MaxConnIdle
+	pgxCfg.MaxConnLifetimeJitter = cfg.MaxConnLifetimeJitter
+	pool, err := pgxpool.NewWithConfig(ctx, pgxCfg)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pgx pool: %w", err)
 	}
@@ -46,6 +54,7 @@ func NewPostgresPool(ctx context.Context, cfg PostgresConfig) (*pgxpool.Pool, er
 		pool.Close()
 		return nil, fmt.Errorf("failed to ping postgres database: %w", err)
 	}
+	prometheus.MustRegister(metrics.NewPgxPoolCollector(pool))
 	slog.Info("successfully connected to postgres database")
 	return pool, nil
 }

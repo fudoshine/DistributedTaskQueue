@@ -549,28 +549,31 @@ func (r *JobRepository) MarkAsCancelledCascading(ctx context.Context, queueName,
 		return fmt.Errorf("taskID %q is not a valid UUID: %w", failedTaskID, err)
 	}
 
-	// Recursively find and cancel all descendants of the failed task
+	// Recursively find and cancel all descendants of the failed task.
+	// This uses an explicit path array to avoid cycles and stays compatible with
+	// PostgreSQL 14's recursive CTE support.
 	query := `
 		WITH RECURSIVE descendants AS (
 			-- Base case: direct children of failed task
-			SELECT child_job_id
+			SELECT child_job_id, ARRAY[child_job_id] AS path
 			FROM job_dependencies
 			WHERE parent_job_id = $1
 			
 			UNION ALL
 			
 			-- Recursive case: children of children
-			SELECT jd.child_job_id
+			SELECT jd.child_job_id, d.path || jd.child_job_id
 			FROM job_dependencies jd
 			INNER JOIN descendants d ON jd.parent_job_id = d.child_job_id
+			WHERE NOT jd.child_job_id = ANY(d.path)
 		)
-		CYCLE child_job_id USING path
 		UPDATE processed_jobs
 		SET status = $2,
 		    lease_token = NULL,
 		    lease_expires_at = NULL
-		WHERE id IN (SELECT child_job_id FROM descendants)
-		  AND status IN ($3, $4, $5);  -- Only cancel PENDING/QUEUED/RUNNING
+		FROM descendants
+		WHERE processed_jobs.id = descendants.child_job_id
+		  AND processed_jobs.status IN ($3, $4, $5);  -- Only cancel PENDING/QUEUED/RUNNING
 	`
 
 	tag, err := r.pool.Exec(ctx, query, id, StatusCancelled, StatusPending, StatusQueued, StatusRunning)

@@ -392,11 +392,11 @@ func main() {
 		return
 	}
 	defer store.Close()
-	if err := repository.RunMigrations(cfg.Postgres.ConnString, "file://db/migrations"); err != nil {
+	if err := repository.RunMigrations(cfg.Postgres.ConnString, cfg.Postgres.MigrationPath); err != nil {
 		slog.Error("run migrations", "error", err)
 		return
 	}
-	pool, err := repository.NewPostgresPool(ctx, repository.PostgresConfig{ConnString: cfg.Postgres.ConnString})
+	pool, err := repository.NewPostgresPool(ctx, cfg.Postgres)
 	if err != nil {
 		slog.Error("connect Postgres", "error", err)
 		return

@@ -22,8 +22,14 @@ type RedisConfig struct {
 }
 
 type PostgresConfig struct {
-	ConnString string
-	MaxRetries int
+	ConnString            string
+	MigrationPath         string
+	MaxRetries            int
+	MaxConns              int
+	MinConns              int
+	MaxConnIdle           time.Duration
+	MaxConnLifetime       time.Duration
+	MaxConnLifetimeJitter time.Duration
 }
 
 type MetricsConfig struct {
@@ -31,12 +37,12 @@ type MetricsConfig struct {
 }
 
 type QueueConfig struct {
-	Name                  string
-	HoldTTL               time.Duration
-	JanitorInterval       time.Duration
-	DelayedPollEvery      time.Duration
-	DepthPollEvery        time.Duration
-	TaskProducerInterval  time.Duration
+	Name                 string
+	HoldTTL              time.Duration
+	JanitorInterval      time.Duration
+	DelayedPollEvery     time.Duration
+	DepthPollEvery       time.Duration
+	TaskProducerInterval time.Duration
 }
 
 type WorkerConfig struct {
@@ -77,8 +83,14 @@ func Load() (*Config, error) {
 			DB:       parseInt("REDIS_DB", 0),
 		},
 		Postgres: PostgresConfig{
-			ConnString: getEnv("POSTGRES_CONN_STRING", "postgres://postgres:password@localhost:5432/task_queue?sslmode=disable"),
-			MaxRetries: parseInt("MAX_RETRIES", 3),
+			ConnString:            getEnv("POSTGRES_CONN_STRING", "postgres://postgres:password@localhost:5432/task_queue?sslmode=disable"),
+			MigrationPath:         getEnv("POSTGRES_MIGRATION_PATH", "file://db/migrations"),
+			MaxRetries:            parseInt("MAX_RETRIES", 3),
+			MaxConns:              parseInt("MAX_CONNS", 10),
+			MinConns:              parseInt("MIN_CONNS", 2),
+			MaxConnIdle:           parseDuration("MAX_CONN_IDLE", "5m"),
+			MaxConnLifetime:       parseDuration("MAX_CONN_LIFETIME", "10m"),
+			MaxConnLifetimeJitter: parseDuration("MAX_CONN_LIFETIME_JITTER", "1m"),
 		},
 		Metrics: MetricsConfig{
 			Addr: getEnv("METRICS_ADDR", ":9090"),
@@ -126,6 +138,27 @@ func (c *Config) Validate() error {
 	}
 	if c.Postgres.MaxRetries < 0 {
 		return fmt.Errorf("MAX_RETRIES cannot be negative")
+	}
+	if c.Postgres.MigrationPath == "" {
+		return fmt.Errorf("POSTGRES_MIGRATION_PATH cannot be empty")
+	}
+	if c.Postgres.MaxConnIdle <= 0 {
+		return fmt.Errorf("MAX_CONN_IDLE must be positive")
+	}
+	if c.Postgres.MaxConnLifetime <= 0 {
+		return fmt.Errorf("MAX_CONN_LIFETIME must be positive")
+	}
+	if c.Postgres.MaxConns < 1 {
+		return fmt.Errorf("MAX_CONNS must be at least 1")
+	}
+	if c.Postgres.MinConns < 0 {
+		return fmt.Errorf("MIN_CONNS cannot be negative")
+	}
+	if c.Postgres.MinConns > c.Postgres.MaxConns {
+		return fmt.Errorf("MIN_CONNS cannot be greater than MAX_CONNS")
+	}
+	if c.Postgres.MaxConnLifetimeJitter < 0 {
+		return fmt.Errorf("MAX_CONN_LIFETIME_JITTER cannot be negative")
 	}
 	return nil
 }

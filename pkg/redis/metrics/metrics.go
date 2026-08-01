@@ -34,7 +34,6 @@ var (
 		Name: "queue_dlq_depth",
 		Help: "Number of tasks currently sitting in the dead letter queue, by queue name.",
 	}, []string{"queue"})
-
 	// --- Counters: discrete events, incremented exactly once where they occur.
 	TasksEnqueued = promauto.NewCounterVec(prometheus.CounterOpts{
 		Name: "queue_tasks_enqueued_total",

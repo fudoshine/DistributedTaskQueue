@@ -118,6 +118,58 @@
           "legendFormat": "cascade cancelled/s"
         }
       ]
+    },
+    {
+      "title": "Postgres Pool Connections",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 24, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "pgxpool_acquired_conns",
+          "legendFormat": "acquired"
+        },
+        {
+          "expr": "pgxpool_max_conns",
+          "legendFormat": "max"
+        },
+        {
+          "expr": "pgxpool_idle_conns",
+          "legendFormat": "idle"
+        }
+      ]
+    },
+    {
+      "title": "Postgres Pool Acquire Latency",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 24, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(pgxpool_acquire_duration_seconds_total[5m]) / rate(pgxpool_acquire_total[5m])",
+          "legendFormat": "avg acquire wait"
+        }
+      ]
+    },
+    {
+      "title": "Postgres Pool Canceled Acquires",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 32, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(pgxpool_canceled_acquire_total[5m])",
+          "legendFormat": "canceled acquires/s"
+        }
+      ]
+    },
+    {
+      "title": "Postgres Pool Connection Churn",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 32, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "rate(pgxpool_new_conns_total[5m])",
+          "legendFormat": "new conns/s"
+        }
+      ]
     }
   ]
 }

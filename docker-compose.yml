@@ -58,6 +58,11 @@ services:
       DEPTH_POLL_INTERVAL: "5s"
       TASK_PRODUCER_INTERVAL: "1s"
       SHUTDOWN_TIMEOUT: "30s"
+      MAX_CONNS: "10"
+      MIN_CONNS: "2"
+      MAX_CONN_IDLE: "5m"
+      MAX_CONN_LIFETIME: "1h"
+      MAX_CONN_LIFETIME_JITTER: "30s"
     ports:
       - "9090:9090"
     restart: unless-stopped
