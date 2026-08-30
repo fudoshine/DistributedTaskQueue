@@ -887,25 +887,23 @@ func (r *JobRepository) GetWorkflowID(ctx context.Context, taskID string) (uuid.
 	return workflowID, nil
 }
 
-func (r *JobRepository) GetWorkflow(ctx context.Context, workflowID string) (Workflow, error) {
-	id, err := uuid.Parse(workflowID)
-	if err != nil {
-		return Workflow{}, fmt.Errorf("taskID %q is not a valid UUID: %w", workflowID, err)
+func (r *JobRepository) GetWorkflow(ctx context.Context, workflowID uuid.UUID) (Workflow, error) {
+	if workflowID == uuid.Nil {
+		return Workflow{}, fmt.Errorf("workflowID is nil")
 	}
 
 	var workflow Workflow
 	query := `SELECT id, name, status, created_at FROM workflows WHERE id = $1;`
-	err = r.pool.QueryRow(ctx, query, id).Scan(&workflow.ID, &workflow.Name, &workflow.Status, &workflow.CreatedAt)
+	err := r.pool.QueryRow(ctx, query, workflowID).Scan(&workflow.ID, &workflow.Name, &workflow.Status, &workflow.CreatedAt)
 	if err != nil {
 		return Workflow{}, fmt.Errorf("failed to get workflow for ID %s: %w", workflowID, err)
 	}
 	return workflow, nil
 }
 
-func (r *JobRepository) GetTask(ctx context.Context, taskID string) (JobRow, error) {
-	id, err := uuid.Parse(taskID)
-	if err != nil {
-		return JobRow{}, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
+func (r *JobRepository) GetTask(ctx context.Context, taskID uuid.UUID) (JobRow, error) {
+	if taskID == uuid.Nil {
+		return JobRow{}, fmt.Errorf("taskID is nil")
 	}
 
 	var task JobRow
@@ -913,7 +911,7 @@ func (r *JobRepository) GetTask(ctx context.Context, taskID string) (JobRow, err
           error_log, created_at, processed_at, available_at
 		  FROM processed_jobs
 		  WHERE id = $1;`
-	err = r.pool.QueryRow(ctx, query, id).Scan(
+	err := r.pool.QueryRow(ctx, query, taskID).Scan(
 		&task.ID, &task.WorkflowID, &task.TaskType, &task.Status,
 		&task.CurrentRetries, &task.MaxRetries,
 		&task.ErrorLog, &task.CreatedAt, &task.ProcessedAt, &task.AvailableAt,
@@ -922,7 +920,8 @@ func (r *JobRepository) GetTask(ctx context.Context, taskID string) (JobRow, err
 		return JobRow{}, fmt.Errorf("failed to get Task for ID %s: %w", taskID, err)
 	}
 
-	rows, err := r.pool.Query(ctx, `SELECT parent_job_id FROM job_dependencies WHERE child_job_id=$1;`, id)
+	var rows pgx.Rows
+	rows, err = r.pool.Query(ctx, `SELECT parent_job_id FROM job_dependencies WHERE child_job_id=$1;`, taskID)
 	if err != nil {
 		return JobRow{}, fmt.Errorf("failed to get parent IDs for task %s: %w", taskID, err)
 	}

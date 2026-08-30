@@ -18,20 +18,20 @@ func NewWorkflowService(repo *repository.JobRepository) *WorkflowService {
 	}
 }
 
-func (s *WorkflowService) CreateWorkflow(ctx context.Context, name string) (uuid.UUID, error) {
-	return s.repo.CreateWorkflow(ctx, name)
+func (s *WorkflowService) CreateWorkflow(ctx context.Context, workflowName string) (uuid.UUID, error) {
+	return s.repo.CreateWorkflow(ctx, workflowName)
 }
 
-func (s *WorkflowService) CreateTask(ctx context.Context, queueName string, req api.CreateTaskRequest) (uuid.UUID, error) {
-	taskID := uuid.New()
-
-	task := repository.Task{
-		ID:         taskID,
-		WorkflowID: req.WorkflowID,
-		ParentIDs:  req.ParentIDs,
-		TaskType:   req.TaskType,
-		Payload:    req.Payload,
-		MaxRetries: req.MaxRetries,
+func (s *WorkflowService) GetWorkflow(ctx context.Context, workflowID uuid.UUID) (*api.WorkflowResponse, error) {
+	res, err := s.repo.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		return nil, err
 	}
-	return taskID, s.repo.CreateJob(ctx, queueName, task)
+	return &api.WorkflowResponse{
+		ID:        res.ID,
+		Name:      res.Name,
+		CreatedAt: res.CreatedAt,
+		UpdatedAt: res.UpdatedAt,
+		Status:    res.Status,
+	}, nil
 }

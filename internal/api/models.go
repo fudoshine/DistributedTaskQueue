@@ -9,14 +9,14 @@ import (
 )
 
 type CreateWorkflowRequest struct {
-	Name string `json:"name"`
+	Name string `json:"name" binding:"required"`
 }
 type ErrorResponse struct {
-	Error string `json:"error"`
+	Error string `json:"error" binding:"required"`
 }
 type CreateTaskRequest struct {
-	WorkflowID uuid.UUID       `json:"workflow_id"`
-	ParentIDs  []uuid.UUID     `json:"parent_ids"`
+	WorkflowID uuid.UUID       `json:"workflow_id" binding:"required"`
+	ParentIDs  []uuid.UUID     `json:"parent_ids" binding:"required"`
 	TaskType   string          `json:"task_type"`
 	Payload    json.RawMessage `json:"payload"`
 	MaxRetries int             `json:"max_retries"`
