@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"distributed-queue/internal/domain"
 	"distributed-queue/pkg/redis/metrics"
 	"encoding/json"
 	"errors"
@@ -32,16 +33,6 @@ var (
 	ErrJobNotFound = errors.New("job execution failed: no processed_jobs row found for taskID")
 )
 
-// Job status values stored in processed_jobs.status and workflows.status.
-const (
-	StatusPending   = "PENDING"
-	StatusQueued    = "QUEUED"
-	StatusRunning   = "RUNNING"
-	StatusCompleted = "COMPLETED"
-	StatusFailed    = "FAILED"
-	StatusCancelled = "CANCELLED"
-)
-
 // Task represents a single unit of work to be created in Postgres before
 // its ID is enqueued onto Redis. WorkflowID and ParentIDs model the DAG
 // structure: every task belongs to exactly one workflow, and may optionally
@@ -54,7 +45,26 @@ type Task struct {
 	Payload    json.RawMessage
 	MaxRetries int // 0 means "use the schema default (3)"
 }
-
+type Workflow struct {
+	ID        uuid.UUID
+	Name      string
+	Status    domain.WorkflowStatus
+	CreatedAt time.Time
+	UpdatedAt time.Time
+}
+type JobRow struct {
+	ID             uuid.UUID
+	WorkflowID     uuid.UUID
+	ParentIDs      []uuid.UUID
+	TaskType       string
+	Status         domain.TaskStatus
+	CurrentRetries int
+	MaxRetries     int
+	ErrorLog       *string
+	CreatedAt      time.Time
+	ProcessedAt    *time.Time
+	AvailableAt    time.Time
+}
 type JobRepository struct {
 	pool *pgxpool.Pool
 }
@@ -106,7 +116,7 @@ func (r *JobRepository) CreateWorkflow(ctx context.Context, name string) (uuid.U
 		VALUES ($1, $2)
 		RETURNING id;
 	`
-	if err := r.pool.QueryRow(ctx, query, name, StatusPending).Scan(&id); err != nil {
+	if err := r.pool.QueryRow(ctx, query, name, domain.WorkflowStatusPending).Scan(&id); err != nil {
 		metrics.JobRepoErrors.WithLabelValues("_workflow", "CreateWorkflow").Inc()
 		return uuid.Nil, fmt.Errorf("failed to create workflow %q: %w", name, err)
 	}
@@ -134,9 +144,9 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 	}
 	defer tx.Rollback(ctx)
 
-	status := StatusPending
+	status := domain.TaskStatusPending
 	if len(task.ParentIDs) == 0 {
-		status = StatusQueued
+		status = domain.TaskStatusQueued
 	}
 
 	// Insert the job
@@ -234,14 +244,14 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID, deli
 		  )
 		RETURNING lease_token, attempt_number;
 		`
-	err = tx.QueryRow(ctx, query, id, StatusRunning, claim.LeaseToken, leaseTTL.String(), StatusQueued, StatusCompleted, generation, parsedDeliveryID).Scan(&claim.LeaseToken, &claim.Attempt)
+	err = tx.QueryRow(ctx, query, id, domain.TaskStatusRunning, claim.LeaseToken, leaseTTL.String(), domain.TaskStatusQueued, domain.TaskStatusCompleted, generation, parsedDeliveryID).Scan(&claim.LeaseToken, &claim.Attempt)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
 			return JobClaim{}, fmt.Errorf("failed to claim job %s: %w", taskID, err)
 		}
 
-		var status string
+		var status domain.TaskStatus
 		var currentGeneration int
 		err = tx.QueryRow(ctx, `SELECT status, delivery_generation FROM processed_jobs WHERE id = $1;`, id).Scan(&status, &currentGeneration)
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -257,12 +267,12 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID, deli
 		}
 
 		switch status {
-		case StatusCompleted:
+		case domain.TaskStatusCompleted:
 			metrics.JobsDuplicateSkipped.WithLabelValues(queueName).Inc()
 			return JobClaim{}, ErrDuplicateJob
-		case StatusFailed, StatusCancelled:
+		case domain.TaskStatusFailed, domain.TaskStatusCancelled:
 			return JobClaim{}, ErrTerminalJob
-		case StatusRunning:
+		case domain.TaskStatusRunning:
 			return JobClaim{}, ErrJobAlreadyOwned
 		default:
 			return JobClaim{}, ErrJobNotReady
@@ -319,10 +329,10 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 		  AND lease_expires_at > NOW()
 		RETURNING current_retries, max_retries, status, delivery_generation, available_at;
 	`
-	var status string
+	var status domain.TaskStatus
 	var generation int
 	var availableAt time.Time
-	err = tx.QueryRow(ctx, query, id, errLog, StatusFailed, StatusQueued, StatusRunning, leaseToken).Scan(&currentRetries, &maxRetries, &status, &generation, &availableAt)
+	err = tx.QueryRow(ctx, query, id, errLog, domain.TaskStatusFailed, domain.TaskStatusQueued, domain.TaskStatusRunning, leaseToken).Scan(&currentRetries, &maxRetries, &status, &generation, &availableAt)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, 0, ErrLeaseLost
@@ -330,7 +340,7 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 		metrics.JobRepoErrors.WithLabelValues(queueName, "RecordFailure").Inc()
 		return 0, 0, fmt.Errorf("failed to record failure for task %s: %w", taskID, err)
 	}
-	if status == StatusQueued {
+	if status == domain.TaskStatusQueued {
 		if _, err := insertDelivery(ctx, tx, id, queueName, generation, availableAt); err != nil {
 			return 0, 0, fmt.Errorf("schedule retry delivery: %w", err)
 		}
@@ -373,7 +383,7 @@ func (r *JobRepository) RenewLease(ctx context.Context, queueName, taskID string
 		  AND status = $4
 		  AND lease_token = $2
 		  AND lease_expires_at > NOW();
-	`, id, leaseToken, leaseTTL.String(), StatusRunning)
+	`, id, leaseToken, leaseTTL.String(), domain.TaskStatusRunning)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "RenewLease").Inc()
 		return false, fmt.Errorf("failed to renew lease for job %s: %w", taskID, err)
@@ -400,7 +410,7 @@ func (r *JobRepository) RecoverExpiredJob(ctx context.Context, queueName, taskID
 		WHERE id = $1
 		  AND status = $3
 		  AND lease_expires_at <= NOW();
-	`, id, StatusQueued, StatusRunning)
+	`, id, domain.TaskStatusQueued, domain.TaskStatusRunning)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "RecoverExpiredJob").Inc()
 		return RecoveryKeepInflight, fmt.Errorf("failed to recover expired job %s: %w", taskID, err)
@@ -409,7 +419,7 @@ func (r *JobRepository) RecoverExpiredJob(ctx context.Context, queueName, taskID
 		return RecoveryRequeue, nil
 	}
 
-	var status string
+	var status domain.TaskStatus
 	err = r.pool.QueryRow(ctx, `SELECT status FROM processed_jobs WHERE id = $1;`, id).Scan(&status)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RecoveryAcknowledge, nil
@@ -418,12 +428,12 @@ func (r *JobRepository) RecoverExpiredJob(ctx context.Context, queueName, taskID
 		metrics.JobRepoErrors.WithLabelValues(queueName, "RecoverExpiredJob").Inc()
 		return RecoveryKeepInflight, fmt.Errorf("failed to inspect abandoned job %s: %w", taskID, err)
 	}
-	if status == StatusQueued {
+	if status == domain.TaskStatusQueued {
 		// The process may have crashed after changing Postgres to QUEUED but
 		// before it republished the Redis entry. Repeating the move is safe.
 		return RecoveryRequeue, nil
 	}
-	if status == StatusRunning {
+	if status == domain.TaskStatusRunning {
 		return RecoveryKeepInflight, nil
 	}
 	return RecoveryAcknowledge, nil
@@ -464,7 +474,7 @@ func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queu
 		  AND lease_token = $4
 		  AND lease_expires_at > NOW()
 		RETURNING workflow_id;
-	`, id, StatusCompleted, StatusRunning, leaseToken).Scan(&workflowID)
+	`, id, domain.TaskStatusCompleted, domain.TaskStatusRunning, leaseToken).Scan(&workflowID)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -504,7 +514,7 @@ func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queu
 		SELECT id, $5, uuid_generate_v4(), 0, NOW(), FALSE FROM promoted_children
 		ON CONFLICT (task_id, generation) DO NOTHING
 		RETURNING task_id;
-	`, id, StatusPending, StatusCompleted, StatusQueued, queueName)
+	`, id, domain.TaskStatusPending, domain.TaskStatusCompleted, domain.TaskStatusQueued, queueName)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
 		return nil, fmt.Errorf("failed to schedule children of job %s: %w", taskID, err)
@@ -576,7 +586,7 @@ func (r *JobRepository) MarkAsCancelledCascading(ctx context.Context, queueName,
 		  AND processed_jobs.status IN ($3, $4, $5);  -- Only cancel PENDING/QUEUED/RUNNING
 	`
 
-	tag, err := r.pool.Exec(ctx, query, id, StatusCancelled, StatusPending, StatusQueued, StatusRunning)
+	tag, err := r.pool.Exec(ctx, query, id, domain.TaskStatusCancelled, domain.TaskStatusPending, domain.TaskStatusQueued, domain.TaskStatusRunning)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "MarkAsCancelledCascading").Inc()
 		return fmt.Errorf("failed to mark descendants as CANCELLED: %w", err)
@@ -648,7 +658,7 @@ func (r *JobRepository) UpdateWorkflowStatus(ctx context.Context, workflowID uui
 		END;  -- Only update if status actually changed
 	`
 
-	tag, err := r.pool.Exec(ctx, query, workflowID, StatusRunning, StatusCompleted, StatusFailed, StatusCancelled)
+	tag, err := r.pool.Exec(ctx, query, workflowID, domain.TaskStatusRunning, domain.TaskStatusCompleted, domain.TaskStatusFailed, domain.TaskStatusCancelled)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues("_workflow", "UpdateWorkflowStatus").Inc()
 		return fmt.Errorf("failed to update workflow status: %w", err)
@@ -656,16 +666,17 @@ func (r *JobRepository) UpdateWorkflowStatus(ctx context.Context, workflowID uui
 
 	if tag.RowsAffected() > 0 {
 		// Check what the new status is to increment appropriate metric
-		var newStatus string
+		var newStatus domain.TaskStatus
 		checkQuery := `SELECT status FROM workflows WHERE id = $1;`
 		if err := r.pool.QueryRow(ctx, checkQuery, workflowID).Scan(&newStatus); err == nil {
-			if newStatus == StatusCompleted {
+			switch newStatus {
+			case domain.TaskStatusCompleted:
 				metrics.WorkflowsCompleted.Inc()
 				slog.Info("[WORKFLOW] completed", "workflowId", workflowID)
-			} else if newStatus == StatusFailed {
+			case domain.TaskStatusFailed:
 				metrics.WorkflowsFailed.Inc()
 				slog.Warn("[WORKFLOW] failed", "workflowId", workflowID)
-			} else {
+			default:
 				slog.Info("[WORKFLOW] status updated", "workflowId", workflowID, "status", newStatus)
 			}
 		}
@@ -763,7 +774,7 @@ func (r *JobRepository) RecoverExpiredLeases(ctx context.Context, queueName stri
 			RETURNING id, task_id, delivery_id, generation, queue_name
 		)
 		SELECT id, task_id, delivery_id, generation, queue_name FROM published;
-	`, StatusRunning, limit, StatusQueued, queueName)
+	`, domain.TaskStatusRunning, limit, domain.TaskStatusQueued, queueName)
 	if err != nil {
 		return nil, fmt.Errorf("recover expired leases: %w", err)
 	}
@@ -793,7 +804,7 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 		return RecoveryKeepInflight, fmt.Errorf("begin idle-delivery recovery: %w", err)
 	}
 	defer tx.Rollback(ctx)
-	var status string
+	var status domain.TaskStatus
 	var currentGeneration int
 	var availableAt time.Time
 	var leaseExpiresAt *time.Time
@@ -807,13 +818,13 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 	if err != nil {
 		return RecoveryKeepInflight, fmt.Errorf("inspect idle delivery: %w", err)
 	}
-	if status == StatusRunning && leaseExpiresAt != nil && leaseExpiresAt.After(time.Now()) {
+	if status == domain.TaskStatusRunning && leaseExpiresAt != nil && leaseExpiresAt.After(time.Now()) {
 		return RecoveryKeepInflight, nil
 	}
-	if currentGeneration != generation || status == StatusCompleted || status == StatusFailed || status == StatusCancelled || status == StatusPending {
+	if currentGeneration != generation || status == domain.TaskStatusCompleted || status == domain.TaskStatusFailed || status == domain.TaskStatusCancelled || status == domain.TaskStatusPending {
 		return RecoveryAcknowledge, nil
 	}
-	if status != StatusQueued && status != StatusRunning {
+	if status != domain.TaskStatusQueued && status != domain.TaskStatusRunning {
 		return RecoveryAcknowledge, nil
 	}
 	nextGeneration := currentGeneration + 1
@@ -821,7 +832,7 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 		UPDATE processed_jobs
 		SET status = $2, lease_token = NULL, lease_expires_at = NULL, delivery_generation = $3
 		WHERE id = $1;
-	`, id, StatusQueued, nextGeneration); err != nil {
+	`, id, domain.TaskStatusQueued, nextGeneration); err != nil {
 		return RecoveryKeepInflight, fmt.Errorf("reset idle delivery: %w", err)
 	}
 	if _, err := insertDelivery(ctx, tx, id, queueName, nextGeneration, availableAt); err != nil {
@@ -843,7 +854,7 @@ func (r *JobRepository) GetStuckPendingJobs(ctx context.Context, olderThan time.
 		WHERE status = $1
 		  AND created_at < NOW() - ($2 || ' seconds')::INTERVAL;
 	`
-	rows, err := r.pool.Query(ctx, query, StatusPending, int(olderThan.Seconds()))
+	rows, err := r.pool.Query(ctx, query, domain.TaskStatusPending, int(olderThan.Seconds()))
 	if err != nil {
 		return nil, fmt.Errorf("failed to query stuck pending jobs: %w", err)
 	}
@@ -874,4 +885,57 @@ func (r *JobRepository) GetWorkflowID(ctx context.Context, taskID string) (uuid.
 		return uuid.Nil, fmt.Errorf("failed to get workflow_id for task %s: %w", taskID, err)
 	}
 	return workflowID, nil
+}
+
+func (r *JobRepository) GetWorkflow(ctx context.Context, workflowID string) (Workflow, error) {
+	id, err := uuid.Parse(workflowID)
+	if err != nil {
+		return Workflow{}, fmt.Errorf("taskID %q is not a valid UUID: %w", workflowID, err)
+	}
+
+	var workflow Workflow
+	query := `SELECT id, name, status, created_at FROM workflows WHERE id = $1;`
+	err = r.pool.QueryRow(ctx, query, id).Scan(&workflow.ID, &workflow.Name, &workflow.Status, &workflow.CreatedAt)
+	if err != nil {
+		return Workflow{}, fmt.Errorf("failed to get workflow for ID %s: %w", workflowID, err)
+	}
+	return workflow, nil
+}
+
+func (r *JobRepository) GetTask(ctx context.Context, taskID string) (JobRow, error) {
+	id, err := uuid.Parse(taskID)
+	if err != nil {
+		return JobRow{}, fmt.Errorf("taskID %q is not a valid UUID: %w", taskID, err)
+	}
+
+	var task JobRow
+	query := `SELECT id, workflow_id, task_type, status, current_retries, max_retries,
+          error_log, created_at, processed_at, available_at
+		  FROM processed_jobs
+		  WHERE id = $1;`
+	err = r.pool.QueryRow(ctx, query, id).Scan(
+		&task.ID, &task.WorkflowID, &task.TaskType, &task.Status,
+		&task.CurrentRetries, &task.MaxRetries,
+		&task.ErrorLog, &task.CreatedAt, &task.ProcessedAt, &task.AvailableAt,
+	)
+	if err != nil {
+		return JobRow{}, fmt.Errorf("failed to get Task for ID %s: %w", taskID, err)
+	}
+
+	rows, err := r.pool.Query(ctx, `SELECT parent_job_id FROM job_dependencies WHERE child_job_id=$1;`, id)
+	if err != nil {
+		return JobRow{}, fmt.Errorf("failed to get parent IDs for task %s: %w", taskID, err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var parentID uuid.UUID
+		if err := rows.Scan(&parentID); err != nil {
+			return JobRow{}, fmt.Errorf("failed to scan parent ID: %w", err)
+		}
+		task.ParentIDs = append(task.ParentIDs, parentID)
+	}
+	if err := rows.Err(); err != nil {
+		return JobRow{}, fmt.Errorf("parent IDs iteration error: %w", err)
+	}
+	return task, nil
 }
