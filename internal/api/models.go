@@ -18,6 +18,7 @@ type CreateTaskRequest struct {
 	WorkflowID uuid.UUID       `json:"workflow_id" binding:"required"`
 	ParentIDs  []uuid.UUID     `json:"parent_ids" binding:"required"`
 	TaskType   string          `json:"task_type"`
+	QueueName  string          `json:"queue_name"`
 	Payload    json.RawMessage `json:"payload"`
 	MaxRetries int             `json:"max_retries"`
 }

@@ -10,14 +10,14 @@ import (
 )
 
 type TaskHandler struct {
-	taskSvc   *service.TaskService
-	queueName string
+	taskSvc           *service.TaskService
+	defaultQueueNames string
 }
 
-func NewTaskHandler(taskSvc *service.TaskService, queueName string) *TaskHandler {
+func NewTaskHandler(taskSvc *service.TaskService, defaultQueueName string) *TaskHandler {
 	return &TaskHandler{
-		taskSvc:   taskSvc,
-		queueName: queueName,
+		taskSvc:           taskSvc,
+		defaultQueueNames: defaultQueueName,
 	}
 }
 
@@ -27,7 +27,11 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	task, err := h.taskSvc.CreateTask(c.Request.Context(), h.queueName, req.WorkflowID, req.ParentIDs, req.TaskType, req.Payload, req.MaxRetries)
+	queueName := req.QueueName
+	if queueName == "" {
+		queueName = h.defaultQueueNames
+	}
+	task, err := h.taskSvc.CreateTask(c.Request.Context(), queueName, req.WorkflowID, req.ParentIDs, req.TaskType, req.Payload, req.MaxRetries)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return

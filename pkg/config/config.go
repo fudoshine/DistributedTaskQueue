@@ -8,11 +8,13 @@ import (
 )
 
 type Config struct {
-	Redis    RedisConfig
-	Postgres PostgresConfig
-	Metrics  MetricsConfig
-	Queue    QueueConfig
-	Worker   WorkerConfig
+	Redis             RedisConfig
+	Postgres          PostgresConfig
+	Metrics           MetricsConfig
+	Queue             QueueConfig
+	Worker            WorkerConfig
+	ServerAddr        string
+	defaultQueueNames string
 }
 
 type RedisConfig struct {
@@ -44,7 +46,9 @@ type QueueConfig struct {
 	DepthPollEvery       time.Duration
 	TaskProducerInterval time.Duration
 }
-
+type TaskTypeConfig struct {
+	Name []string
+}
 type WorkerConfig struct {
 	Count           int
 	ShutdownTimeout time.Duration
@@ -107,6 +111,8 @@ func Load() (*Config, error) {
 			Count:           parseInt("WORKER_COUNT", 5),
 			ShutdownTimeout: parseDuration("SHUTDOWN_TIMEOUT", "30s"),
 		},
+		ServerAddr:        getEnv("SERVER_ADDRESS", ":8080"),
+		defaultQueueNames: getEnv("DEFAULT_QUEUE_NAMES", "queue:video_processing"),
 	}
 
 	// Validate config
@@ -159,6 +165,9 @@ func (c *Config) Validate() error {
 	}
 	if c.Postgres.MaxConnLifetimeJitter < 0 {
 		return fmt.Errorf("MAX_CONN_LIFETIME_JITTER cannot be negative")
+	}
+	if c.ServerAddr == "" {
+		return fmt.Errorf("SERVER_ADDRESS cannot be empty")
 	}
 	return nil
 }
