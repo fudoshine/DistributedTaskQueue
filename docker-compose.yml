@@ -35,9 +35,12 @@ services:
       timeout: 3s
       retries: 5
 
-  app:
-    build: .
-    container_name: queue-app
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    platform: linux/amd64
+    container_name: queue-worker
     depends_on:
       postgres:
         condition: service_healthy
@@ -67,6 +70,29 @@ services:
       - "9090:9090"
     restart: unless-stopped
 
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    platform: linux/amd64
+    container_name: queue-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      POSTGRES_CONN_STRING: "postgres://postgres:password@postgres:5432/task_queue?sslmode=disable"
+      SERVER_ADDRESS: ":8080"
+      QUEUE_NAME: "queue:video_processing"
+      MAX_RETRIES: "3"
+      MAX_CONNS: "5"
+      MIN_CONNS: "1"
+      MAX_CONN_IDLE: "5m"
+      MAX_CONN_LIFETIME: "1h"
+      MAX_CONN_LIFETIME_JITTER: "30s"
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
   prometheus:
     image: prom/prometheus:v2.55.0
     container_name: queue-prometheus
@@ -79,7 +105,7 @@ services:
     ports:
       - "9091:9090"
     depends_on:
-      - app
+      - worker
 
   grafana:
     image: grafana/grafana:11.2.0

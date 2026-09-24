@@ -893,8 +893,8 @@ func (r *JobRepository) GetWorkflow(ctx context.Context, workflowID uuid.UUID) (
 	}
 
 	var workflow Workflow
-	query := `SELECT id, name, status, created_at FROM workflows WHERE id = $1;`
-	err := r.pool.QueryRow(ctx, query, workflowID).Scan(&workflow.ID, &workflow.Name, &workflow.Status, &workflow.CreatedAt)
+	query := `SELECT id, name, status, created_at,updated_at FROM workflows WHERE id = $1;`
+	err := r.pool.QueryRow(ctx, query, workflowID).Scan(&workflow.ID, &workflow.Name, &workflow.Status, &workflow.CreatedAt, &workflow.UpdatedAt)
 	if err != nil {
 		return Workflow{}, fmt.Errorf("failed to get workflow for ID %s: %w", workflowID, err)
 	}

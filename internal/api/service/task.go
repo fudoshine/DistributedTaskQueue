@@ -36,9 +36,14 @@ func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflow
 		return api.TaskResponse{}, err
 	}
 	return api.TaskResponse{
-		ID:             taskID,
-		WorkflowID:     workflowID,
-		ParentIDs:      parentIDs,
+		ID:         taskID,
+		WorkflowID: workflowID,
+		ParentIDs: func() []uuid.UUID {
+			if parentIDs == nil {
+				return []uuid.UUID{}
+			}
+			return parentIDs
+		}(),
 		TaskType:       taskType,
 		Status:         domain.TaskStatusPending,
 		CurrentRetries: 0,
@@ -53,6 +58,10 @@ func (s *TaskService) GetTask(ctx context.Context, taskID uuid.UUID) (*api.TaskR
 	if err != nil {
 		return nil, err
 	}
+	var errorLog *string
+	if res.ErrorLog != nil && *res.ErrorLog != "" {
+		errorLog = res.ErrorLog
+	}
 	return &api.TaskResponse{
 		ID:             res.ID,
 		WorkflowID:     res.WorkflowID,
@@ -61,7 +70,7 @@ func (s *TaskService) GetTask(ctx context.Context, taskID uuid.UUID) (*api.TaskR
 		Status:         res.Status,
 		CurrentRetries: res.CurrentRetries,
 		MaxRetries:     res.MaxRetries,
-		ErrorLog:       res.ErrorLog,
+		ErrorLog:       errorLog,
 		CreatedAt:      res.CreatedAt,
 		AvailableAt:    res.AvailableAt,
 		ProcessedAt:    res.ProcessedAt,

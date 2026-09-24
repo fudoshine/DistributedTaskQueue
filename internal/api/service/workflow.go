@@ -3,7 +3,9 @@ package service
 import (
 	"context"
 	"distributed-queue/internal/api"
+	"distributed-queue/internal/domain"
 	"distributed-queue/pkg/repository"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -18,8 +20,18 @@ func NewWorkflowService(repo *repository.JobRepository) *WorkflowService {
 	}
 }
 
-func (s *WorkflowService) CreateWorkflow(ctx context.Context, workflowName string) (uuid.UUID, error) {
-	return s.repo.CreateWorkflow(ctx, workflowName)
+func (s *WorkflowService) CreateWorkflow(ctx context.Context, workflowName string) (*api.WorkflowResponse, error) {
+	id, err := s.repo.CreateWorkflow(ctx, workflowName)
+	if err != nil {
+		return nil, err
+	}
+	return &api.WorkflowResponse{
+		ID:        id,
+		Name:      workflowName,
+		Status:    domain.WorkflowStatusPending,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}, nil
 }
 
 func (s *WorkflowService) GetWorkflow(ctx context.Context, workflowID uuid.UUID) (*api.WorkflowResponse, error) {

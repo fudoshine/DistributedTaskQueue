@@ -22,6 +22,11 @@ func NewTaskHandler(taskSvc *service.TaskService, defaultQueueName string) *Task
 }
 
 func (h *TaskHandler) CreateTask(c *gin.Context) {
+	workflowID, err := uuid.Parse(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid workflow_id"})
+		return
+	}
 	var req api.CreateTaskRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
@@ -31,7 +36,7 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 	if queueName == "" {
 		queueName = h.defaultQueueNames
 	}
-	task, err := h.taskSvc.CreateTask(c.Request.Context(), queueName, req.WorkflowID, req.ParentIDs, req.TaskType, req.Payload, req.MaxRetries)
+	task, err := h.taskSvc.CreateTask(c.Request.Context(), queueName, workflowID, req.ParentIDs, req.TaskType, req.Payload, req.MaxRetries)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
