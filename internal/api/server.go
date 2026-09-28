@@ -26,7 +26,7 @@ type TaskHandler interface {
 
 func NewServer(addr string, workflowHandler WorkflowHandler, taskHandler TaskHandler) *Server {
 	router := gin.Default()
-
+	gin.SetMode(gin.ReleaseMode)
 	//routes
 	v1 := router.Group("/api/v1")
 	{
@@ -34,6 +34,9 @@ func NewServer(addr string, workflowHandler WorkflowHandler, taskHandler TaskHan
 		v1.GET("/workflows/:id", workflowHandler.GetWorkflow)
 		v1.POST("/workflows/:id/tasks", taskHandler.CreateTask)
 		v1.GET("/tasks/:id", taskHandler.GetTask)
+		v1.GET("/health", func(c *gin.Context) {
+			c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		})
 	}
 	srv := &http.Server{
 		Addr:    addr,

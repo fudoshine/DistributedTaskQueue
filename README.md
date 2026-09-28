@@ -1,148 +1,215 @@
-# Distributed Task Queue
+# GoQueue — Distributed Task Queue
 
-A production-ready task queue in Go with DAG workflow orchestration — tasks declare parent dependencies and only execute once all parents complete. Failures cascade: if a parent fails, all descendants are automatically cancelled. Built on Redis Streams consumer groups for queueing and PostgreSQL for durable state.
+A distributed task queue built in Go. Tasks declare parent dependencies and only run once all parents complete. Failures cascade — if a parent fails, all downstream tasks are automatically cancelled. Built on Redis Streams for delivery and PostgreSQL for durable execution state.
+
+This isn't a wrapper around an existing queue library. It's a ground-up implementation to understand the hard parts: what breaks when a worker crashes mid-execution, how to guarantee exactly-once semantics without distributed locks, and how DAG execution actually works at the storage layer.
 
 ---
 
-## How It Works
+## What it does
 
-```mermaid
-flowchart LR
-    producer[Producer] -->|writes jobs + outbox| postgres[(PostgreSQL<br/>jobs, DAG dependencies, outbox)]
-    postgres -->|outbox relay| streams[Redis Streams<br/>consumer group]
-    streams -->|XREADGROUP| worker[Workers]
-    worker -->|claim, complete, or fail| postgres
-    postgres -->|ready child delivery| streams
+You submit a workflow — a set of tasks with dependency edges. GoQueue handles execution order, retries, failure propagation, and recovery. You don't manage any of that.
+
+```
+VIDEO_UPLOAD ──► VIDEO_TRANSCODE ──► VIDEO_NOTIFY
 ```
 
-Tasks with unmet dependencies stay in Postgres as `PENDING`. A worker completing a parent automatically enqueues its children — you never manage execution order manually.
+`VIDEO_TRANSCODE` won't start until `VIDEO_UPLOAD` completes. If `VIDEO_UPLOAD` fails after 3 retries, `VIDEO_TRANSCODE` and `VIDEO_NOTIFY` are automatically cancelled. No polling, no manual state checks.
+
+---
+
+## Architecture
+
+```mermaid
+flowchart TB
+    CLIENT(["Client\n(curl / SDK / service)"])
+
+    subgraph api_layer["API Layer  ─── scale horizontally"]
+        API["REST API :8080\n(n instances)"]
+    end
+
+    subgraph pg["PostgreSQL"]
+        JOBS[("processed_jobs\nworkflows\njob_dependencies")]
+        OUTBOX[("outbox")]
+        JOBS -. "same txn" .-> OUTBOX
+    end
+
+    subgraph worker_binary["Worker Binary  ─── scale horizontally"]
+        direction TB
+        RELAY["Outbox Relay\npoll → XADD → mark delivered"]
+
+        subgraph workers["Worker Pool"]
+            W1["Worker"]
+            W2["Worker"]
+            W3["Worker ···"]
+        end
+
+        JANITOR["Janitor\nidle recovery"]
+    end
+
+    subgraph redis["Redis"]
+        STREAM[["Streams\nconsumer group"]]
+        DLQ[["Dead Letter\nQueue"]]
+    end
+
+    CLIENT -- "POST /workflows\nPOST /tasks\nGET status" --> API
+    API -- "INSERT job + outbox\n(single transaction)" --> pg
+
+    OUTBOX -- "FOR UPDATE SKIP LOCKED" --> RELAY
+    RELAY -- "XADD" --> STREAM
+
+    STREAM -- "XREADGROUP" --> workers
+
+    workers -- "update job state" --> pg
+    workers -- "XACK" --> STREAM
+    workers -- "max retries" --> DLQ
+
+    JANITOR -- "XAUTOCLAIM" --> STREAM
+    JANITOR -- "check lease" --> pg
+```
+
+The API and Worker are **separate binaries** that communicate only through PostgreSQL — no direct RPC between them. Both can be scaled horizontally. The API writes jobs, the Worker picks them up through Redis Streams.
+
+---
+
+## How it works
+
+### 1. Submitting a workflow
+
+When you `POST /api/v1/workflows/:id/tasks`, the API writes the job row and an outbox row in a **single PostgreSQL transaction**. Either both land or neither does. The task is not yet in Redis.
+
+```
+API → BEGIN
+API → INSERT INTO processed_jobs (status = QUEUED)
+API → INSERT INTO outbox (delivered = false)
+API → COMMIT
+```
+
+### 2. Outbox relay delivers to Redis
+
+A relay goroutine inside the worker binary polls the outbox table every second using `FOR UPDATE SKIP LOCKED` — safe for multiple relay replicas. It publishes each undelivered row to Redis Streams via `XADD`, then marks it delivered.
+
+```
+Relay → SELECT undelivered rows FOR UPDATE SKIP LOCKED
+Relay → XADD → Redis Stream
+Relay → UPDATE outbox SET delivered = true
+```
+
+If the relay crashes between `XADD` and marking delivered, it re-publishes on restart. The generation counter and delivery ID on each message make that duplicate harmless.
+
+### 3. Worker claims and executes
+
+Workers call `XREADGROUP` to atomically take a message from the stream into their Pending Entry List (PEL). They then claim a PostgreSQL lease — a UUID token issued at claim time. Every subsequent write (heartbeat, completion, failure) must present that token. A stale worker whose lease was revoked cannot commit.
+
+```
+Worker → XREADGROUP (message enters PEL)
+Worker → UPDATE processed_jobs SET status=RUNNING, lease_token=<uuid>
+Worker → ... do work ...
+Worker → UPDATE processed_jobs SET status=COMPLETED WHERE lease_token=<uuid>
+Worker → XACK (remove from PEL)
+```
+
+### 4. DAG fanout on completion
+
+When a task completes, a single transaction marks it done, acquires a `pg_advisory_xact_lock` on the workflow ID, finds all children whose every parent is now `COMPLETED`, promotes them to `QUEUED`, and writes their outbox rows. The advisory lock prevents two concurrent parent completions from racing on a shared child.
+
+### 5. Failure and recovery
+
+**Retry:** On failure, `RecordFailure` increments the counter and schedules a new outbox delivery with exponential backoff — all in one transaction.
+
+**DLQ:** Once `max_retries` is exhausted, the task moves to the dead letter queue and all descendants are cascade-cancelled via recursive CTE.
+
+**Crash recovery:** The Janitor runs on an interval. It uses `XAUTOCLAIM` to find PEL entries idle longer than `HOLD_TTL`, then checks the PostgreSQL lease. Redis tells it what *might* need recovery. PostgreSQL decides what *actually* does. A live lease is never touched.
+
+---
+
+## Key guarantees
+
+- **At-least-once delivery** — Transactional Outbox ensures every job reaches Redis even across crashes
+- **Exactly-once execution** — UUID lease token fences all writes; stale workers cannot commit
+- **Atomic DAG fanout** — parent completion and child enqueue in a single transaction with advisory lock
+- **Cycle-safe cancellation** — recursive CTE with path tracking cancels all descendants
+- **No polling** — tasks are pushed to Redis by the relay, workers block on `XREADGROUP`
+- **Crash recovery** — Janitor reclaims idle PEL entries; PostgreSQL lease is the authority
 
 ---
 
 ## Quick Start
 
 ```bash
-# Start dependencies
-docker-compose up -d
+# start postgres and redis
+docker-compose up -d postgres redis
 
-# Apply schema
-psql "postgres://postgres:password@localhost:5432/task_queue?sslmode=disable" < db/schema.sql
+# terminal 1 — worker
+go run ./cmd/worker/
 
-# Copy and configure env
-cp .env.example .env
-
-# Build and run
-go build -o distributed-queue .
-./distributed-queue
+# terminal 2 — api
+go run ./cmd/api/
 ```
 
-Check it's running:
+Create a workflow:
 ```bash
-curl http://localhost:9090/health
-# {"status":"healthy","service":"distributed-queue"}
+curl -X POST http://localhost:8080/api/v1/workflows \
+  -H "Content-Type: application/json" \
+  -d '{"name": "video-pipeline"}'
 ```
+
+Add a task:
+```bash
+curl -X POST http://localhost:8080/api/v1/workflows/<workflow-id>/tasks \
+  -H "Content-Type: application/json" \
+  -d '{
+    "task_type": "VIDEO_UPLOAD",
+    "payload": {"file": "video.mp4"}
+  }'
+```
+
+Check status:
+```bash
+curl http://localhost:8080/api/v1/workflows/<workflow-id>
+curl http://localhost:8080/api/v1/tasks/<task-id>
+```
+
+---
+
+## API
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/v1/workflows` | Create a workflow |
+| `GET` | `/api/v1/workflows/:id` | Get workflow status |
+| `POST` | `/api/v1/workflows/:id/tasks` | Add a task to a workflow |
+| `GET` | `/api/v1/tasks/:id` | Get task status |
+
+Tasks accept an optional `queue_name` field. If omitted, the default queue from config is used. This allows routing different task types to different worker pools without any API changes.
+
+---
 
 ## Observability
 
-Prometheus is available at `http://localhost:9091` and Grafana at `http://localhost:3000` (`admin` / `admin`). The dashboard includes queue throughput, workflow state, failures, and PostgreSQL pool activity: connections in use, idle connections, acquisition rate, and acquisition latency.
+Prometheus at `http://localhost:9091`, Grafana at `http://localhost:3000` (`admin` / `admin`).
+
+28 metrics across queue depth, throughput, DAG fanout, error rates, and PostgreSQL pool state (acquire rate, wait latency, idle/active connections).
 
 ![Grafana dashboard](docs/images/grafana-dashboard.png)
 
-Expected output when running:
-```
-{"level":"INFO","msg":"worker thread started, waiting for tasks..."}
-{"level":"INFO","msg":"producer thread started, generating tasks..."}
-{"level":"INFO","msg":"metrics server starting","addr":":9090"}
-{"level":"INFO","msg":"task enqueued","taskId":"a1b2c3...","counter":1}
-{"level":"INFO","msg":"task consumed, running idempotency check","taskId":"a1b2c3..."}
-{"level":"INFO","msg":"task acknowledged and synchronized everywhere","taskId":"a1b2c3..."}
-```
-
 ---
 
-## Usage
+## Configuration
 
-```go
-// 1. Create a workflow
-workflowID, _ := jobRepo.CreateWorkflow(ctx, "video-pipeline")
+All configuration via environment variables. Key ones:
 
-// 2. Define tasks — root tasks have no parents
-upload := repository.Task{
-    ID:         uuid.New(),
-    WorkflowID: workflowID,
-    ParentIDs:  []uuid.UUID{},           // root: runs immediately
-    TaskType:   "VIDEO_UPLOAD",
-    Payload:    json.RawMessage(`{"file":"video.mp4"}`),
-}
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `POSTGRES_CONN_STRING` | — | PostgreSQL connection string |
+| `REDIS_ADDRESS` | `localhost:6379` | Redis address |
+| `QUEUE_NAME` | `queue:video_processing` | Default queue name |
+| `WORKER_COUNT` | `5` | Number of concurrent workers |
+| `MAX_RETRIES` | `3` | Max retries before DLQ |
+| `HOLD_TTL` | `20s` | Lease TTL per task attempt |
+| `SERVER_ADDRESS` | `:8080` | API server address |
 
-// 3. Dependent tasks declare their parents
-transcode := repository.Task{
-    ID:         uuid.New(),
-    WorkflowID: workflowID,
-    ParentIDs:  []uuid.UUID{upload.ID},  // waits for upload
-    TaskType:   "VIDEO_TRANSCODE",
-    Payload:    json.RawMessage(`{"resolution":"1080p"}`),
-}
-
-// 4. Write to DB first (write-ahead log), then enqueue root to Redis
-jobRepo.CreateJob(ctx, queueName, upload)
-jobRepo.CreateJob(ctx, queueName, transcode)
-store.EnqueueTask(ctx, queueName, upload.ID.String())
-
-// transcode will be auto-enqueued once upload completes ✅
-```
-
----
-
-## Key Features
-
-- **DAG Workflows** — multi-parent task dependencies via junction table
-- **Idempotency** — CAS pattern prevents duplicate processing
-- **Circuit Breaker** — fast-fail when database is down
-- **Cascading Cancellation** — cycle-safe recursive PostgreSQL query cancels all descendants on parent failure
-- **Graceful Shutdown** — waits for in-flight tasks before exit
-- **Retry + DLQ** — exponential backoff, dead letter queue for permanent failures
-- **Orphan Recovery** — transactional outbox guarantees at-least-once delivery to Redis even across server crashes
-- **Redis Streams Delivery** — consumer groups, acknowledgements, heartbeats, and idle-delivery recovery
-- **Prometheus + Grafana** — queue metrics and PostgreSQL pool connections, acquire rate, and wait latency
-- **Configurable PostgreSQL Pool** — connection limits, idle timeout, lifetime, and jitter are environment-configurable
-
----
-
-## Why Not Bull / Asynq / Temporal?
-
-This was built from scratch to deeply understand distributed systems internals — idempotency, WAL patterns, CAS, cascading cancellations in recursive SQL, circuit breakers. Libraries abstract all of that away. See [docs/Tradeoff.md](docs/Tradeoff.md) for every design decision and what was traded off.
-
----
-
-## Tech Stack
-
-- **Go 1.25.6** — application runtime
-- **Redis 7 Streams** — consumer-group queue, pending-entry tracking, and recovery
-- **PostgreSQL 14+** — durable job state and DAG dependencies
-- **Prometheus** — metrics and observability
-- **Grafana** — dashboard visualization
-
----
-
-## Documentation
-
-### Guides
-| File | What it covers |
-|------|----------------|
-| [docs/quick-start.md](docs/quick-start.md) | Running the system, first workflow example |
-| [docs/architecture.md](docs/architecture.md) | Components, data flow, design patterns |
-| [docs/system-flows.md](docs/system-flows.md) | Step-by-step flow diagrams for every operation |
-| [docs/configuration.md](docs/configuration.md) | All environment variables with tuning guidance |
-| [docs/troubleshooting.md](docs/troubleshooting.md) | Common issues and debugging strategies |
-
-### Reference
-| File | What it covers |
-|------|----------------|
-| [docs/Tradeoff.md](docs/Tradeoff.md) | Design tradeoffs and why decisions were made |
-| [docs/METRICS_COMPLETE.md](docs/METRICS_COMPLETE.md) | All metrics with Grafana query examples |
-| [docs/ATOMIC_DAG_ORCHESTRATION.md](docs/ATOMIC_DAG_ORCHESTRATION.md) | Write-ahead log and atomic child enqueue |
-| [docs/GRACEFUL_SHUTDOWN.md](docs/GRACEFUL_SHUTDOWN.md) | Shutdown sequence and timeout behavior |
+Full reference in [docs/configuration.md](docs/configuration.md).
 
 ---
 
@@ -150,20 +217,33 @@ This was built from scratch to deeply understand distributed systems internals �
 
 ```
 .
-├── main.go                        # Entry point, goroutine setup, graceful shutdown
-├── db/
-│   └── schema.sql                 # PostgreSQL schema
+├── cmd/
+│   ├── api/          # REST API binary
+│   └── worker/       # Worker binary (execution, janitor, outbox relay)
+├── internal/
+│   └── api/          # Handlers, services, models (API-private)
 ├── pkg/
-│   ├── circuitbreaker/            # Circuit breaker implementation
-│   ├── config/                    # Environment config loading and validation
-│   ├── models/                    # Shared types
-│   ├── redis/                     # Redis store and metrics
-│   └── repository/                # PostgreSQL job and workflow queries
-└── docs/                          # Documentation
+│   ├── circuitbreaker/
+│   ├── config/
+│   ├── redis/
+│   └── repository/   # PostgreSQL queries
+├── db/
+│   ├── schema.sql
+│   └── migrations/
+├── deploy/
+│   ├── prometheus/
+│   └── grafana/
+└── docs/
 ```
 
 ---
 
-## License
+## Design decisions
 
-MIT
+Every non-obvious decision has a writeup in [docs/Tradeoff.md](docs/Tradeoff.md) — what the naive approach breaks, what was chosen instead, and what it costs.
+
+---
+
+## Tech Stack
+
+Go 1.25 · PostgreSQL 14 · Redis 7 Streams · Prometheus · Grafana · Docker
