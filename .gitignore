@@ -5,6 +5,8 @@
 
 # Binaries
 distributed-queue
+worker
+api
 *.exe
 *.exe~
 *.dll

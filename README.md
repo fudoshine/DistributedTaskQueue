@@ -129,12 +129,13 @@ When a task completes, a single transaction marks it done, acquires a `pg_adviso
 - **Fenced, idempotent execution** — UUID lease token on every claim; completions, failures, and heartbeats all validate the token, making stale worker commits structurally impossible
 - **Atomic DAG fanout** — parent completion and child enqueue in a single transaction with advisory lock
 - **Cycle-safe cancellation** — recursive CTE with path tracking cancels all descendants
-- **No polling** — tasks are pushed to Redis by the relay, workers block on `XREADGROUP`
+- **Workers block on `XREADGROUP`** — no polling in the hot path; the relay polls the outbox on a 1s interval to move jobs into Redis
 - **Crash recovery** — Janitor reclaims idle PEL entries; PostgreSQL lease is the authority
+- **Handler idempotency is the caller's responsibility** — the lease prevents duplicate concurrent execution, but if a handler has already sent an email or called an external API before crashing, the fence cannot undo it. Handlers must be idempotent.
 
 ---
 
-## Performance
+## Repository-layer performance
 
 Measured on Apple M3 Pro (11-core), 18GB RAM, local Docker PostgreSQL 14, `synchronous_commit = on`, pgx pool of 20 connections.
 
@@ -144,10 +145,10 @@ Measured on Apple M3 Pro (11-core), 18GB RAM, local Docker PostgreSQL 14, `synch
 | `CreateJob` — parallel (20 connections) | ~6,500/sec | — |
 | `TryStartJob` (fenced claim) — serial | ~2,500/sec | — |
 | `TryStartJob` (fenced claim) — parallel | ~7,500/sec | — |
-| `MarkAsCancelledCascading` — 10-node chain | ~2,700/sec | — |
+| `MarkAsCancelledCascading` — 11-task chain | ~2,800/sec | — |
 | End-to-end `CreateWorkflow + CreateJob` | — | p50: 0.66ms · p95: 0.88ms · p99 < 2ms |
 
-**Single-node ceiling:** parallelism gives ~3x over serial. The bottleneck is PostgreSQL WAL flush and commit latency on one node — not the application layer. Horizontal scaling requires partitioning workflows across multiple Postgres nodes.
+**Single-node ceiling:** parallelism gives ~3x over serial. The bottleneck is likely commit/WAL-bound on one Postgres node — not the application layer. Horizontal scaling requires partitioning workflows across multiple Postgres nodes.
 
 Reproduce with:
 ```bash
@@ -269,6 +270,12 @@ Full reference in [docs/configuration.md](docs/configuration.md).
 ## Design decisions
 
 Every non-obvious decision has a writeup in [docs/Tradeoff.md](docs/Tradeoff.md) — what the naive approach breaks, what was chosen instead, and what it costs.
+
+Two mechanisms worth calling out explicitly:
+
+**Circuit Breaker** ([`pkg/circuitbreaker/`](pkg/circuitbreaker/)) — a 3-state FSM (closed/open/half-open) wraps every PostgreSQL call in the worker. When the DB goes down, the breaker opens immediately and rejects claims without hitting the pool, preventing goroutine pile-up. It probes on a configurable reset timeout and closes automatically on success.
+
+**Dual heartbeat** — while a task is running, two independent heartbeats fire on an interval: a PostgreSQL lease renewal (which extends `lease_expires_at`) and a Redis `XCLAIM` touch (which resets the PEL idle timer). PostgreSQL is the authority — a Redis heartbeat failure is a warning, not a cancellation. A DB lease loss cancels the handler context immediately.
 
 ---
 

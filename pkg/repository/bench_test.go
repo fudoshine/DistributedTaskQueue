@@ -1,20 +1,20 @@
 // Benchmarks for the repository layer.
 //
-// Environment: Apple M3 Pro, 18GB RAM, local Docker Postgres 14
+// Environment: Apple M3 Pro (11-core), 18GB RAM, local Docker Postgres 14
 // synchronous_commit = on (verified — numbers are not inflated by async commits)
+// pgx pool of 20 connections
 //
 // Run all benchmarks:
 //
-//	go test ./pkg/repository/ -bench=. -benchtime=5s -benchmem
+//	go test ./pkg/repository/ -run '^$' -bench=. -benchtime=20000x -count=1
 //
 // Run only latency test:
 //
-//	go test ./pkg/repository/ -run TestEndToEndLatency -v
+//	go test ./pkg/repository/ -run TestEndToEndLatency -v -count=1
 package repository_test
 
 import (
 	"context"
-	"distributed-queue/internal/domain"
 	"distributed-queue/pkg/config"
 	"distributed-queue/pkg/repository"
 	"encoding/json"
@@ -23,6 +23,7 @@ import (
 	"log"
 	"log/slog"
 	"os"
+	"sort"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -54,8 +55,15 @@ func TestMain(m *testing.M) {
 	}
 	sharedPool = pool
 	sharedRepo = repository.NewJobRepository(pool)
+
+	// silence structured and standard loggers so benchmark output is clean
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	log.SetOutput(io.Discard)
+
+	// truncate benchmark tables so rows don't accumulate across runs
+	_, _ = pool.Exec(context.Background(),
+		`TRUNCATE processed_jobs, workflows, job_dependencies, outbox CASCADE`)
+
 	code := m.Run()
 	pool.Close()
 	os.Exit(code)
@@ -116,7 +124,6 @@ func BenchmarkTryStartJob(b *testing.B) {
 	ctx := context.Background()
 	workflowID, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob")
 
-	// pre-create all tasks and collect their real delivery IDs
 	type entry struct {
 		taskID     uuid.UUID
 		deliveryID uuid.UUID
@@ -124,10 +131,12 @@ func BenchmarkTryStartJob(b *testing.B) {
 	entries := make([]entry, b.N)
 	for i := 0; i < b.N; i++ {
 		taskID := uuid.New()
-		_ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: taskID, WorkflowID: workflowID,
 			TaskType: "BENCH", Payload: json.RawMessage(`{}`),
-		})
+		}); err != nil {
+			b.Fatalf("create job: %v", err)
+		}
 		deliveryID, err := getDeliveryID(ctx, taskID)
 		if err != nil {
 			b.Fatalf("get delivery id: %v", err)
@@ -137,16 +146,19 @@ func BenchmarkTryStartJob(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_, err := sharedRepo.TryStartJob(ctx, "queue:bench",
+		claim, err := sharedRepo.TryStartJob(ctx, "queue:bench",
 			entries[i].taskID.String(), entries[i].deliveryID.String(), 0, 30*time.Second)
 		if err != nil {
 			b.Fatalf("claim job: %v", err)
+		}
+		if claim.LeaseToken == uuid.Nil {
+			b.Fatalf("expected valid lease token, got nil")
 		}
 	}
 }
 
 // BenchmarkCascadingCancellation measures MarkAsCancelledCascading
-// with a 10-node linear chain per run.
+// with an 11-task chain (root + 10 children) per run.
 func BenchmarkCascadingCancellation(b *testing.B) {
 	ctx := context.Background()
 	b.ResetTimer()
@@ -154,18 +166,22 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 		b.StopTimer()
 		workflowID, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("cancel-bench-%d", i))
 		rootID := uuid.New()
-		_ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: rootID, WorkflowID: workflowID,
 			TaskType: "ROOT", Payload: json.RawMessage(`{}`),
-		})
+		}); err != nil {
+			b.Fatalf("create root: %v", err)
+		}
 		prevID := rootID
 		for j := 0; j < 10; j++ {
 			childID := uuid.New()
-			_ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+			if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 				ID: childID, WorkflowID: workflowID,
 				ParentIDs: []uuid.UUID{prevID},
 				TaskType:  "CHILD", Payload: json.RawMessage(`{}`),
-			})
+			}); err != nil {
+				b.Fatalf("create child: %v", err)
+			}
 			prevID = childID
 		}
 		b.StartTimer()
@@ -215,10 +231,12 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 	entries := make([]entry, b.N)
 	for i := 0; i < b.N; i++ {
 		taskID := uuid.New()
-		_ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: taskID, WorkflowID: workflowID,
 			TaskType: "BENCH", Payload: json.RawMessage(`{}`),
-		})
+		}); err != nil {
+			b.Fatalf("create job: %v", err)
+		}
 		deliveryID, err := getDeliveryID(ctx, taskID)
 		if err != nil {
 			b.Fatalf("get delivery id: %v", err)
@@ -234,10 +252,14 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 			if i >= len(entries) {
 				return
 			}
-			_, err := sharedRepo.TryStartJob(ctx, "queue:bench",
+			claim, err := sharedRepo.TryStartJob(ctx, "queue:bench",
 				entries[i].taskID.String(), entries[i].deliveryID.String(), 0, 30*time.Second)
 			if err != nil {
 				b.Errorf("claim job: %v", err)
+				return
+			}
+			if claim.LeaseToken == uuid.Nil {
+				b.Errorf("expected valid lease token, got nil")
 				return
 			}
 		}
@@ -287,22 +309,13 @@ func TestEndToEndLatency(t *testing.T) {
 	}
 	avg := total / runs
 
-	// sort for percentiles
-	for i := 0; i < len(durations); i++ {
-		for j := i + 1; j < len(durations); j++ {
-			if durations[j] < durations[i] {
-				durations[i], durations[j] = durations[j], durations[i]
-			}
-		}
-	}
+	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 
-	t.Logf("Environment: local Docker Postgres 14, synchronous_commit=on")
+	t.Logf("Environment: Apple M3 Pro, local Docker Postgres 14, synchronous_commit=on, pool=20")
 	t.Logf("CreateWorkflow+CreateJob latency over %d runs (after %d warmup):", runs, warmup)
 	t.Logf("  avg: %v", avg)
 	t.Logf("  p50: %v", durations[runs*50/100])
 	t.Logf("  p95: %v", durations[runs*95/100])
 	t.Logf("  p99: %v", durations[runs*99/100])
 	t.Logf("  max: %v", durations[runs-1])
-
-	_ = domain.TaskStatusPending
 }
