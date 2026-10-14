@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type TaskHandler struct {
@@ -56,6 +57,10 @@ func (h *TaskHandler) GetTask(c *gin.Context) {
 	}
 	task, err := h.taskSvc.GetTask(c.Request.Context(), ID)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "task not found"})
+			return
+		}
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}

@@ -88,6 +88,12 @@ services:
       MAX_CONN_IDLE: "5m"
       MAX_CONN_LIFETIME: "1h"
       MAX_CONN_LIFETIME_JITTER: "30s"
+      HOLD_TTL: "20s"
+      JANITOR_INTERVAL: "5s"
+      DELAYED_POLL_INTERVAL: "2s"
+      DEPTH_POLL_INTERVAL: "5s"
+      TASK_PRODUCER_INTERVAL: "1s"
+      SHUTDOWN_TIMEOUT: "30s"
     ports:
       - "8080:8080"
     restart: unless-stopped

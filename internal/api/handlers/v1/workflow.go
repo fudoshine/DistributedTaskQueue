@@ -7,6 +7,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 type WorkflowHandler struct {
@@ -46,6 +47,11 @@ func (h *WorkflowHandler) GetWorkflow(c *gin.Context) {
 
 	workflow, err := h.workflowSvc.GetWorkflow(c.Request.Context(), ID)
 	if err != nil {
+		if err == pgx.ErrNoRows {
+			c.JSON(http.StatusNotFound, gin.H{"error": "workflow not found"})
+			return
+		}
+
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
