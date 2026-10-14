@@ -2,7 +2,7 @@
 
 A distributed task queue built in Go. Tasks declare parent dependencies and only run once all parents complete. Failures cascade — if a parent fails, all downstream tasks are automatically cancelled. Built on Redis Streams for delivery and PostgreSQL for durable execution state.
 
-This isn't a wrapper around an existing queue library. It's a ground-up implementation to understand the hard parts: what breaks when a worker crashes mid-execution, how to guarantee exactly-once semantics without distributed locks, and how DAG execution actually works at the storage layer.
+This isn't a wrapper around an existing queue library. It's a ground-up implementation to understand the hard parts: what breaks when a worker crashes mid-execution, how to guarantee at-least-once delivery with fenced idempotent state transitions, and how DAG execution actually works at the storage layer.
 
 ---
 
@@ -126,11 +126,39 @@ When a task completes, a single transaction marks it done, acquires a `pg_adviso
 ## Key guarantees
 
 - **At-least-once delivery** — Transactional Outbox ensures every job reaches Redis even across crashes
-- **Exactly-once execution** — UUID lease token fences all writes; stale workers cannot commit
+- **Fenced, idempotent execution** — UUID lease token on every claim; completions, failures, and heartbeats all validate the token, making stale worker commits structurally impossible
 - **Atomic DAG fanout** — parent completion and child enqueue in a single transaction with advisory lock
 - **Cycle-safe cancellation** — recursive CTE with path tracking cancels all descendants
 - **No polling** — tasks are pushed to Redis by the relay, workers block on `XREADGROUP`
 - **Crash recovery** — Janitor reclaims idle PEL entries; PostgreSQL lease is the authority
+
+---
+
+## Performance
+
+Measured on Apple M3 Pro (11-core), 18GB RAM, local Docker PostgreSQL 14, `synchronous_commit = on`, pgx pool of 20 connections.
+
+| Operation | Throughput | Latency |
+|---|---|---|
+| `CreateJob` — serial, full transactional outbox | ~2,000/sec | — |
+| `CreateJob` — parallel (20 connections) | ~6,500/sec | — |
+| `TryStartJob` (fenced claim) — serial | ~2,500/sec | — |
+| `TryStartJob` (fenced claim) — parallel | ~7,500/sec | — |
+| `MarkAsCancelledCascading` — 10-node chain | ~2,700/sec | — |
+| End-to-end `CreateWorkflow + CreateJob` | — | p50: 0.66ms · p95: 0.88ms · p99 < 2ms |
+
+**Single-node ceiling:** parallelism gives ~3x over serial. The bottleneck is PostgreSQL WAL flush and commit latency on one node — not the application layer. Horizontal scaling requires partitioning workflows across multiple Postgres nodes.
+
+Reproduce with:
+```bash
+# throughput benchmarks
+go test ./pkg/repository/ -run '^$' -bench=. -benchtime=20000x -count=1
+
+# latency test (5000 samples, 20 warmup)
+go test ./pkg/repository/ -run TestEndToEndLatency -v -count=1
+```
+
+Benchmarks are in [`pkg/repository/bench_test.go`](pkg/repository/bench_test.go).
 
 ---
 
