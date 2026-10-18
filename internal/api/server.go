@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -25,9 +26,8 @@ type TaskHandler interface {
 }
 
 func NewServer(addr string, workflowHandler WorkflowHandler, taskHandler TaskHandler) *Server {
-	router := gin.Default()
 	gin.SetMode(gin.ReleaseMode)
-	//routes
+	router := gin.Default()
 	v1 := router.Group("/api/v1")
 	{
 		v1.POST("/workflows", workflowHandler.CreateWorkflow)
@@ -39,8 +39,10 @@ func NewServer(addr string, workflowHandler WorkflowHandler, taskHandler TaskHan
 		})
 	}
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: router.Handler(),
+		Addr:              addr,
+		Handler:           router.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
 	}
 	return &Server{
 		engine: router,

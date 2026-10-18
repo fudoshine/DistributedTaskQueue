@@ -163,3 +163,4 @@ Alert rules:
 - 2026-07-11: Diagnosed flat metrics — producer was creating 1 workflow forever, not real DAGs. Rewrote producer to create 3-step `VIDEO_UPLOAD→VIDEO_TRANSCODE→VIDEO_NOTIFY` pipelines per tick. Each pipeline is its own workflow.
 - 2026-08-01 (Codex): Diagnosed pool sizing (confirmed non-issue), found worker concurrency likely bottleneck (inflight pinned at 5), confirmed 20% failure rate is reproducible/deterministic, fixed `CYCLE` syntax error in cascade-cancel query.
 - 2026-08-03 (Kiro): Updated CLAUDE.md to consolidate context across all Kiro + Codex sessions.
+- 2026-10-18: Fenced idle-delivery recovery with PostgreSQL `NOW()`, added cursor-based Redis PEL recovery, removed incomplete REST idempotency route enforcement, and added the protocol breaking-check gate.

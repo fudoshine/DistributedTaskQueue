@@ -1,0 +1,10 @@
+version: v1
+name: buf.build/distributed-queue/queue
+
+lint:
+  use:
+    - STANDARD
+
+breaking:
+  use:
+    - FILE

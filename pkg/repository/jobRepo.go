@@ -807,19 +807,15 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 	var status domain.TaskStatus
 	var currentGeneration int
 	var availableAt time.Time
-	var leaseExpiresAt *time.Time
 	err = tx.QueryRow(ctx, `
-		SELECT status, delivery_generation, available_at, lease_expires_at
+		SELECT status, delivery_generation, available_at
 		FROM processed_jobs WHERE id = $1 FOR UPDATE;
-	`, id).Scan(&status, &currentGeneration, &availableAt, &leaseExpiresAt)
+	`, id).Scan(&status, &currentGeneration, &availableAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RecoveryAcknowledge, nil
 	}
 	if err != nil {
 		return RecoveryKeepInflight, fmt.Errorf("inspect idle delivery: %w", err)
-	}
-	if status == domain.TaskStatusRunning && leaseExpiresAt != nil && leaseExpiresAt.After(time.Now()) {
-		return RecoveryKeepInflight, nil
 	}
 	if currentGeneration != generation || status == domain.TaskStatusCompleted || status == domain.TaskStatusFailed || status == domain.TaskStatusCancelled || status == domain.TaskStatusPending {
 		return RecoveryAcknowledge, nil
@@ -828,12 +824,19 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 		return RecoveryAcknowledge, nil
 	}
 	nextGeneration := currentGeneration + 1
-	if _, err := tx.Exec(ctx, `
+	result, err := tx.Exec(ctx, `
 		UPDATE processed_jobs
 		SET status = $2, lease_token = NULL, lease_expires_at = NULL, delivery_generation = $3
-		WHERE id = $1;
-	`, id, domain.TaskStatusQueued, nextGeneration); err != nil {
+		WHERE id = $1
+		  AND (status <> $4 OR lease_expires_at IS NULL OR lease_expires_at <= NOW());
+	`, id, domain.TaskStatusQueued, nextGeneration, domain.TaskStatusRunning)
+	if err != nil {
 		return RecoveryKeepInflight, fmt.Errorf("reset idle delivery: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		// PostgreSQL is the clock and the fence. A live lease must remain
+		// owned by its worker even when the janitor host clock is ahead.
+		return RecoveryKeepInflight, nil
 	}
 	if _, err := insertDelivery(ctx, tx, id, queueName, nextGeneration, availableAt); err != nil {
 		return RecoveryKeepInflight, fmt.Errorf("schedule recovered delivery: %w", err)

@@ -5,8 +5,13 @@
 
 # Binaries
 distributed-queue
-worker
+/worker
 api
+# Keep generated API artifacts ignored, but version the protocol source.
+!api/
+api/*
+!api/proto/
+!api/proto/**
 *.exe
 *.exe~
 *.dll

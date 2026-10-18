@@ -75,9 +75,45 @@
 | No distributed lock manager needed | Worker must renew lease on interval or lose ownership |
 | Recovery decision is deterministic — DB is the authority | Slightly more complex claim query |
 
+**On external side effects:** The lease prevents a stale worker from writing to PostgreSQL, but it cannot undo work already done outside the database. If a handler sent an email or called an external API before its lease was revoked, the fence does not roll that back. Handlers must be idempotent — the system guarantees at-most-once database writes per lease, not at-most-once execution of arbitrary side effects.
+
 ---
 
-## 6. Recursive Cancellation with Path Tracking
+## 6. Advisory Lock on Workflow ID for DAG Fanout
+
+**Problem:** When a parent task completes, the system must find all children whose every parent is now `COMPLETED` and promote them to `QUEUED`. In a multi-parent DAG, two parents can complete concurrently. Without coordination, both completion transactions observe the other parent as still `RUNNING` — neither promotes the shared child, and it waits forever.
+
+**Decision:** `CompleteJobAndScheduleChildren` acquires a `pg_advisory_xact_lock` on the workflow ID inside the transaction before checking children. This serializes all completions within a workflow, ensuring exactly one transaction sees all parents as `COMPLETED` and promotes the child.
+
+| Advantages | Disadvantages |
+|---|---|
+| Eliminates the multi-parent race without application-layer coordination | Serializes all completions within a single workflow |
+| Lock is transaction-scoped — released automatically on commit or rollback | A wide workflow with many concurrent completions becomes a bottleneck |
+| No separate lock table or Redis lock needed | Lock contention grows with workflow fan-in degree |
+| Postgres advisory locks are lightweight — no row-level blocking | Single-workflow throughput is capped by serial completion rate |
+
+**Known limit:** For a workflow with N tasks completing simultaneously, the advisory lock forces serial execution of all N completion transactions. This is acceptable for typical DAG workflows (depth 3-10). For extremely wide workflows (hundreds of concurrent completions), partitioning completions across multiple workflows or using optimistic concurrency would be needed.
+
+---
+
+## 7. Dual Heartbeat (PostgreSQL + Redis)
+
+**Problem:** A worker holding a task must signal liveness to two systems: PostgreSQL (which holds the lease) and Redis (which tracks the PEL idle time). Using only one creates a gap.
+
+- **Redis heartbeat only:** The janitor uses cursor-advancing `XAUTOCLAIM` to
+  find idle PEL entries. If a worker renews the Redis idle timer but its PostgreSQL lease expires, the janitor's DB check will recover the job — but if the Redis idle timer was recently reset, `XAUTOCLAIM` won't surface it until the next idle window. The worker and the recovered job run concurrently.
+- **PostgreSQL heartbeat only:** The DB lease stays alive, but the Redis PEL idle timer keeps counting. Eventually `XAUTOCLAIM` surfaces the entry to the janitor. The janitor checks the DB lease — it's still valid — so it correctly leaves it alone. But this requires the janitor to do a DB round-trip for every surfaced entry, including live ones.
+
+**Decision:** Both heartbeats fire independently on the same interval. The PostgreSQL lease renewal (`RenewLease`) is the authority — a failure here cancels the handler context immediately. The Redis `XCLAIM` touch is supplementary — a failure is logged as a warning and processing continues. If only the Redis touch fails, the janitor will surface the entry earlier than necessary but the DB lease check will correctly prevent recovery.
+
+| Advantages | Disadvantages |
+|---|---|
+| Janitor surfaces genuinely idle entries, not live ones | Two network round-trips per heartbeat interval |
+| DB lease loss cancels handler immediately — no orphaned work | Redis heartbeat failure adds log noise without action |
+| Redis idle timer stays accurate — reduces unnecessary janitor DB checks | Two failure modes to reason about instead of one |
+| PostgreSQL remains the single authority for all correctness decisions | |
+
+## 8. Recursive Cancellation with Path Tracking
 
 **Problem:** When a parent task fails, all downstream dependents must be cancelled. A naive approach of cancelling only direct children misses multi-level dependencies. A recursive CTE without cycle detection can loop infinitely if the dependency graph has a cycle. PostgreSQL 14 does not support the `CYCLE` keyword in recursive CTEs.
 
@@ -92,7 +128,7 @@
 
 ---
 
-## 7. Two-Binary Architecture (Worker + API)
+## 9. Two-Binary Architecture (Worker + API)
 
 **Problem:** Running the HTTP API and the queue worker in the same process couples their failure modes and scaling. A spike in API traffic can starve worker goroutines, and a worker crash takes down the API. A single binary cannot be scaled independently — you cannot add more workers without also adding more API instances.
 

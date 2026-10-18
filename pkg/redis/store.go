@@ -6,6 +6,7 @@ import (
 	"distributed-queue/pkg/redis/metrics"
 	"fmt"
 	"strconv"
+	"sync"
 	"time"
 
 	redisclient "github.com/redis/go-redis/v9"
@@ -21,7 +22,9 @@ type Delivery struct {
 }
 
 type RedisStore struct {
-	rdb *redisclient.Client
+	rdb      *redisclient.Client
+	cursorMu sync.Mutex
+	cursors  map[string]string
 }
 
 func NewRedisStore(ctx context.Context, cfg config.RedisConfig, _ time.Duration) (*RedisStore, error) {
@@ -32,7 +35,7 @@ func NewRedisStore(ctx context.Context, cfg config.RedisConfig, _ time.Duration)
 		rdb.Close()
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
-	return &RedisStore{rdb: rdb}, nil
+	return &RedisStore{rdb: rdb, cursors: make(map[string]string)}, nil
 }
 
 func (s *RedisStore) Close() error { return s.rdb.Close() }
@@ -120,12 +123,21 @@ func (s *RedisStore) TouchDelivery(ctx context.Context, queueName, consumer, str
 	return nil
 }
 
-// ClaimIdleDeliveries transfers idle PEL entries to the janitor. The caller
-// must still consult Postgres before acknowledging or replacing a delivery.
+// ClaimIdleDeliveries transfers idle PEL entries to the janitor. The cursor is
+// retained per queue so successive batches scan the full PEL before wrapping.
+// The caller must still consult Postgres before acknowledging or replacing a
+// delivery.
 func (s *RedisStore) ClaimIdleDeliveries(ctx context.Context, queueName string, minIdle time.Duration, count int64) ([]Delivery, error) {
-	messages, _, err := s.rdb.XAutoClaim(ctx, &redisclient.XAutoClaimArgs{
+	s.cursorMu.Lock()
+	defer s.cursorMu.Unlock()
+	start := s.cursors[queueName]
+	if start == "" {
+		start = "0-0"
+	}
+
+	messages, next, err := s.rdb.XAutoClaim(ctx, &redisclient.XAutoClaimArgs{
 		Stream: streamKey(queueName), Group: groupName(queueName), Consumer: "janitor",
-		MinIdle: minIdle, Start: "0-0", Count: count,
+		MinIdle: minIdle, Start: start, Count: count,
 	}).Result()
 	if err == redisclient.Nil {
 		return nil, nil
@@ -133,6 +145,11 @@ func (s *RedisStore) ClaimIdleDeliveries(ctx context.Context, queueName string, 
 	if err != nil {
 		metrics.StoreErrors.WithLabelValues(queueName, "ClaimIdleDeliveries").Inc()
 		return nil, fmt.Errorf("claim idle stream deliveries: %w", err)
+	}
+	if next == "0-0" {
+		delete(s.cursors, queueName)
+	} else {
+		s.cursors[queueName] = next
 	}
 	deliveries := make([]Delivery, 0, len(messages))
 	for _, message := range messages {

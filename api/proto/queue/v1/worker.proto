@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package queue.v1;
+
+option go_package = "distributed-queue/api/gen/queue/v1;queuev1";
+
+import "google/protobuf/duration.proto";
+import "google/protobuf/timestamp.proto";
+
+// WorkerGatewayService is private to Queue Platform workers. Public task submission
+// and status APIs remain REST APIs owned by the platform.
+service WorkerGatewayService {
+  // RegisterWorker requires mTLS. The gateway derives the workload principal
+  // from the client certificate; WorkerMetadata is descriptive only.
+  rpc RegisterWorker(RegisterWorkerRequest) returns (RegisterWorkerResponse);
+  rpc RenewSession(RenewSessionRequest) returns (RenewSessionResponse);
+  rpc LeaseTask(LeaseTaskRequest) returns (LeaseTaskResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  rpc CompleteTask(CompleteTaskRequest) returns (CompleteTaskResponse);
+  rpc FailTask(FailTaskRequest) returns (FailTaskResponse);
+}
+
+message RegisterWorkerRequest {
+  WorkerMetadata metadata = 1;
+  repeated Capability advertised_capabilities = 2;
+}
+
+message WorkerMetadata {
+  string service = 1;
+  string instance_id = 2;
+  string build_version = 3;
+  uint32 max_concurrency = 4;
+}
+
+message Capability {
+  string task_type = 1;
+  string handler_version = 2;
+}
+
+message RegisterWorkerResponse {
+  WorkerSession session = 1;
+  google.protobuf.Timestamp session_expires_at = 2;
+  repeated Capability authorized_capabilities = 3;
+  google.protobuf.Timestamp hard_expires_at = 4;
+}
+
+// The token is opaque and sensitive. It is valid only when presented over mTLS
+// by the workload principal to which the gateway issued it.
+message WorkerSession {
+  bytes token = 1;
+}
+
+message RenewSessionRequest {
+  WorkerSession session = 1;
+}
+
+message RenewSessionResponse {
+  google.protobuf.Timestamp session_expires_at = 1;
+  google.protobuf.Timestamp hard_expires_at = 2;
+}
+
+// One LeaseTask request represents one free local handler slot. The gateway
+// returns at most one task lease for each request.
+message LeaseTaskRequest {
+  WorkerSession session = 1;
+  google.protobuf.Duration wait_timeout = 2;
+}
+
+message LeaseTaskResponse {
+  oneof result {
+    TaskLease lease = 1;
+    NoTask no_task = 2;
+  }
+}
+
+message NoTask {
+  google.protobuf.Duration retry_after = 1;
+}
+
+message TaskLease {
+  TaskEnvelope task = 1;
+  bytes lease_token = 2;
+  google.protobuf.Timestamp lease_expires_at = 3;
+  google.protobuf.Duration heartbeat_every = 4;
+  ResultUploadGrant result_upload = 5;
+}
+
+message TaskEnvelope {
+  string task_id = 1;
+  string workflow_id = 2;
+  string saga_id = 3;
+  string step_id = 4;
+  string task_type = 5;
+  string handler_version = 6;
+  Payload payload = 7;
+  uint32 attempt = 8;
+  string idempotency_key = 9;
+  google.protobuf.Timestamp deadline = 10;
+  string traceparent = 11;
+}
+
+message Payload {
+  string content_type = 1;
+  string schema_name = 2;
+  uint32 schema_version = 3;
+  bytes data = 4;
+}
+
+// Issued only for task types whose catalog entry permits object-backed results.
+// upload_url is an opaque, short-lived, single-object upload grant and must not
+// be logged or persisted by an SDK.
+message ResultUploadGrant {
+  string object_key = 1;
+  string upload_url = 2;
+  google.protobuf.Timestamp expires_at = 3;
+  uint64 max_size_bytes = 4;
+  string content_type = 5;
+}
+
+message HeartbeatRequest {
+  WorkerSession session = 1;
+  string task_id = 2;
+  bytes lease_token = 3;
+}
+
+message HeartbeatResponse {
+  bool accepted = 1;
+  google.protobuf.Timestamp lease_expires_at = 2;
+}
+
+message CompleteTaskRequest {
+  WorkerSession session = 1;
+  string task_id = 2;
+  bytes lease_token = 3;
+  TaskResult result = 4;
+}
+
+message TaskResult {
+  string content_type = 1;
+  string schema_name = 2;
+  uint32 schema_version = 3;
+
+  oneof storage {
+    bytes inline_data = 4;
+    ObjectReference object = 5;
+  }
+}
+
+message ObjectReference {
+  string object_key = 1;
+  uint64 size_bytes = 2;
+  bytes sha256 = 3;
+}
+
+message CompleteTaskResponse {
+  bool accepted = 1;
+}
+
+message FailTaskRequest {
+  WorkerSession session = 1;
+  string task_id = 2;
+  bytes lease_token = 3;
+  FailureKind kind = 4;
+  string message = 5;
+}
+
+message FailTaskResponse {
+  bool accepted = 1;
+}
+
+enum FailureKind {
+  FAILURE_KIND_UNSPECIFIED = 0;
+  FAILURE_KIND_RETRYABLE = 1;
+  FAILURE_KIND_PERMANENT = 2;
+  FAILURE_KIND_CANCELLED = 3;
+}

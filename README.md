@@ -271,6 +271,12 @@ Full reference in [docs/configuration.md](docs/configuration.md).
 
 Every non-obvious decision has a writeup in [docs/Tradeoff.md](docs/Tradeoff.md) — what the naive approach breaks, what was chosen instead, and what it costs.
 
+The implementation contract for the planned Go worker SDK is in [docs/WORKER_SDK_DESIGN.md](docs/WORKER_SDK_DESIGN.md). It defines the worker protocol, ownership boundaries, idempotency rules, and the required conformance suite before SDK code is added.
+
+Sprint 1 adds scoped API-key authentication and idempotent REST writes; worker-to-Gateway authentication remains mTLS. The implementation contract is in [docs/REST_API_AUTH_DESIGN.md](docs/REST_API_AUTH_DESIGN.md).
+
+The gated delivery sequence and expected result for each team sprint are in [docs/PLATFORM_SPRINT_PLAN.md](docs/PLATFORM_SPRINT_PLAN.md).
+
 Two mechanisms worth calling out explicitly:
 
 **Circuit Breaker** ([`pkg/circuitbreaker/`](pkg/circuitbreaker/)) — a 3-state FSM (closed/open/half-open) wraps every PostgreSQL call in the worker. When the DB goes down, the breaker opens immediately and rejects claims without hitting the pool, preventing goroutine pile-up. It probes on a configurable reset timeout and closes automatically on success.

@@ -1,0 +1,38 @@
+name: Proto check
+
+on:
+  pull_request:
+    paths:
+      - "api/proto/**"
+      - "Makefile"
+      - ".github/workflows/proto-check.yml"
+  push:
+    branches: [main]
+    paths:
+      - "api/proto/**"
+      - "Makefile"
+      - ".github/workflows/proto-check.yml"
+
+jobs:
+  proto-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.6"
+      - name: Lint and build
+        run: make proto-check
+      - name: Verify protocol compatibility
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            proto_baseline="origin/${{ github.base_ref }}"
+          else
+            proto_baseline="${{ github.event.before }}"
+          fi
+          if git cat-file -e "${proto_baseline}:api/proto/queue/v1/worker.proto" 2>/dev/null; then
+            git branch --force proto-baseline "${proto_baseline}"
+            make proto-breaking PROTO_BREAKING_AGAINST=".git#branch=proto-baseline"
+          fi
