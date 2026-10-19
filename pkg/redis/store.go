@@ -32,7 +32,7 @@ func NewRedisStore(ctx context.Context, cfg config.RedisConfig, _ time.Duration)
 		Addr: cfg.Address, Password: cfg.Password, DB: cfg.DB, Protocol: 2,
 	})
 	if err := rdb.Ping(ctx).Err(); err != nil {
-		rdb.Close()
+		_ = rdb.Close() // Preserve the connection error if cleanup also fails.
 		return nil, fmt.Errorf("failed to connect to Redis: %w", err)
 	}
 	return &RedisStore{rdb: rdb, cursors: make(map[string]string)}, nil

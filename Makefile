@@ -1,8 +1,9 @@
 BUF_VERSION := v1.40.0
 BUF := go run github.com/bufbuild/buf/cmd/buf@$(BUF_VERSION)
 PROTO_BREAKING_AGAINST ?=
+GOLANGCI_LINT ?= golangci-lint
 
-.PHONY: proto-check proto-breaking
+.PHONY: lint proto-check proto-breaking
 
 # Validates the checked-in worker wire contract without writing generated code.
 proto-check:
@@ -13,3 +14,6 @@ proto-check:
 proto-breaking:
 	test -n "$(PROTO_BREAKING_AGAINST)"
 	$(BUF) breaking api/proto --against "$(PROTO_BREAKING_AGAINST)"
+
+lint:
+	$(GOLANGCI_LINT) run ./...

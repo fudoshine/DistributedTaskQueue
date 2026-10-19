@@ -142,7 +142,7 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 		metrics.JobRepoErrors.WithLabelValues(queueName, "CreateJob").Inc()
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
 
 	status := domain.TaskStatusPending
 	if len(task.ParentIDs) == 0 {
@@ -216,7 +216,7 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID, deli
 		metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
 		return JobClaim{}, fmt.Errorf("failed to begin idempotency transaction: %w", err)
 	}
-	defer tx.Rollback(ctx) // no-op if Commit succeeds first
+	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
 
 	claim := JobClaim{LeaseToken: uuid.New()}
 	query := `
@@ -303,7 +303,7 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 	if err != nil {
 		return 0, 0, fmt.Errorf("begin failure transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
 
 	query := `
 		UPDATE processed_jobs
@@ -460,7 +460,7 @@ func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queu
 		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
 		return nil, fmt.Errorf("failed to begin completion transaction: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
 
 	var workflowID uuid.UUID
 	err = tx.QueryRow(ctx, `
@@ -803,7 +803,7 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 	if err != nil {
 		return RecoveryKeepInflight, fmt.Errorf("begin idle-delivery recovery: %w", err)
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
 	var status domain.TaskStatus
 	var currentGeneration int
 	var availableAt time.Time

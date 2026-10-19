@@ -9,9 +9,9 @@ import (
 type State int
 
 const (
-	StateClosed State = iota  // Normal operation
-	StateOpen                 // Failing, reject requests
-	StateHalfOpen            // Testing if recovered
+	StateClosed   State = iota // Normal operation
+	StateOpen                  // Failing, reject requests
+	StateHalfOpen              // Testing if recovered
 )
 
 // CircuitBreaker implements a simple circuit breaker pattern
@@ -20,7 +20,7 @@ type CircuitBreaker struct {
 
 	maxFailures  uint
 	resetTimeout time.Duration
-	
+
 	state        State
 	failures     uint
 	lastFailTime time.Time

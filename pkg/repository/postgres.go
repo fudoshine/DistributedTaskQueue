@@ -23,7 +23,7 @@ func RunMigrations(connString, migrationsPath string) error {
 	if err != nil {
 		return fmt.Errorf("failed to create migrator: %w", err)
 	}
-	defer m.Close()
+	defer func() { _, _ = m.Close() }() // Cleanup must not replace the migration result.
 
 	if err := m.Up(); err != nil && !errors.Is(err, migrate.ErrNoChange) {
 		return fmt.Errorf("migration failed: %w", err)

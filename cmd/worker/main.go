@@ -391,7 +391,7 @@ func main() {
 		slog.Error("connect Redis", "error", err)
 		return
 	}
-	defer store.Close()
+	defer func() { _ = store.Close() }() // Best-effort cleanup on process exit.
 	if err := repository.RunMigrations(cfg.Postgres.ConnString, cfg.Postgres.MigrationPath); err != nil {
 		slog.Error("run migrations", "error", err)
 		return

@@ -201,6 +201,23 @@ curl http://localhost:8080/api/v1/tasks/<task-id>
 
 ---
 
+## Development checks
+
+Install [golangci-lint v2.15.0](https://golangci-lint.run/docs/welcome/install/local/), then run:
+
+```bash
+make lint
+```
+
+This checks all Go packages and tests with the standard linters (including error
+handling, `go vet`, static analysis, and unused code) and `gofmt` formatting.
+The same checks run on pull requests and pushes to `main` in GitHub Actions.
+Use `golangci-lint fmt` to apply formatting fixes.
+
+Protobuf checks remain available through `make proto-check`.
+
+---
+
 ## API
 
 | Method | Endpoint | Description |
