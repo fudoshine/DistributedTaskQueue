@@ -34,5 +34,5 @@ jobs:
           fi
           if git cat-file -e "${proto_baseline}:api/proto/queue/v1/worker.proto" 2>/dev/null; then
             git branch --force proto-baseline "${proto_baseline}"
-            make proto-breaking PROTO_BREAKING_AGAINST=".git#branch=proto-baseline"
+            make proto-breaking PROTO_BREAKING_AGAINST=".git#branch=proto-baseline,subdir=api/proto"
           fi

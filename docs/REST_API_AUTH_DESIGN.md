@@ -1,7 +1,9 @@
 # REST API Authentication and Tenant Authorization
 
-**Status:** planned contract for Sprint 1; authentication and idempotency are
-not implemented in the current REST server.
+**Status:** planned contract; core authentication, draft/seal and idempotency
+are Sprint 1, result-read routes are Sprint 3. None is implemented in the
+current REST server. Canonical lifecycle and result shapes are in the
+[SDK design](WORKER_SDK_DESIGN.md).
 
 Until the API-key and idempotency store are implemented together, POST
 endpoints do not require `Idempotency-Key`. Do not add header enforcement or
@@ -71,7 +73,9 @@ persists it with created workflows and tasks. Initial scopes are:
 | `POST /api/v1/workflows` | `workflows:write` |
 | `GET /api/v1/workflows/:id` | `workflows:read` |
 | `POST /api/v1/workflows/:id/tasks` | `tasks:write` and workflow belongs to the key's tenant |
+| `POST /api/v1/workflows/:id/seal` | `workflows:write` and workflow belongs to the key's tenant |
 | `GET /api/v1/tasks/:id` | `tasks:read` and task belongs to the key's tenant |
+| `GET /api/v1/tasks/:id/result/download-grant` (S3-03) | `tasks:read` and task/result belongs to the key's tenant |
 
 A missing, malformed, unknown, expired, revoked, or bad-secret key returns
 `401` with the same generic body. A valid key without the required scope
@@ -80,19 +84,50 @@ avoid revealing that the object exists.
 
 ### Write idempotency
 
-For `POST /api/v1/workflows` and `POST /api/v1/workflows/:id/tasks`, middleware
+For workflow creation, draft task creation and `POST /api/v1/workflows/:id/seal`, middleware
 must apply the body limit, read the body exactly once into a bounded byte slice,
 compute SHA-256 over those bytes, and replace `Request.Body` with a new reader
 over the same bytes before Gin binding runs. A retry must send the same bytes.
-It writes an idempotency record in the same PostgreSQL transaction as
-the workflow/job and its outbox row. Reusing the same key with a different body
-or path returns `409 Conflict`.
+It writes an idempotency record in the same PostgreSQL transaction as the
+accepted operation. Draft workflow/task writes create no outbox; seal commits
+activation and each root's initial outbox row together with its response.
+Reusing the same key with different body bytes within the same tenant, method
+and exact-path scope returns `409 Conflict`. A different path is a different
+scope and may create separate work; it is not a conflict with the first path.
+Authenticate and check current scope/tenant ownership before replaying a
+stored response, including after key rotation or scope removal.
 
 The transaction first claims the key with `INSERT ... ON CONFLICT DO NOTHING`.
-The winner creates the workflow/job and outbox row, stores the response, and
-commits all of it together. A loser reads the committed record, compares its
-request hash, and returns the stored response. It never creates work before it
-has claimed the key.
+The winner creates the draft workflow/job or activates the sealed graph,
+stores the response, and commits all effects together. A loser reads the
+committed record, compares its request hash, and returns the stored response.
+It never creates work before it has claimed the key. After current
+auth/scope/ownership checks, receipt replay
+precedes mutable workflow-state/worker-health checks: a committed seal remains
+replayable even after its workflow completes or workers go offline. Failed
+validation/health checks roll back the key claim and all attempted mutations.
+The unexpired-DRAFT condition is a new-operation precondition, not an ingress
+authorization check; it must not prevent replaying a committed task/seal receipt.
+
+### Workflow activation and result access
+
+The [draft/seal flow](WORKER_SDK_DESIGN.md#workflow-assembly-and-seal) is part of
+S1-03, not optional SDK behavior: POST workflow returns DRAFT; adding tasks
+never dispatches; POST seal with body {} activates roots atomically. All three
+POST paths require their own scoped Idempotency-Key. Sealed graphs reject new
+tasks with 409 workflow_sealed; expiry and seal race under one DB lock.
+
+The [REST result-read contract](WORKER_SDK_DESIGN.md#rest-result-reads) is owned
+by S3-03. GET task exposes the explicit result union. GET download-grant is
+object-only and may issue fresh read authority, never a new job/outcome; it
+needs no Idempotency-Key. Return no-store JSON and at most 60-second URLs.
+Only grant HMAC/lifetime bookkeeping is persisted; no raw URL or REST replay
+response is stored. The artifact frontend re-checks issuer API-key expiry,
+revocation, tasks:read scope and tenant/result/version before reading; it never
+accepts an API key/session/lease secret in its URL. Result deletion holds cover
+issued grants plus the enforced five-minute maximum read. Missing/foreign
+objects are 404; not-ready/no-object is 409, tombstone is 410 and storage
+unavailability is retryable 503, as specified in the canonical contract.
 
 The task's stable worker-facing `idempotency_key` is platform-generated and
 stored with the task. It protects a business effect after delivery; the REST
@@ -166,7 +201,8 @@ use a process-local limiter as its multi-replica security boundary.
 1. Missing, malformed, unknown, revoked, expired, and wrong-secret keys all
    receive the same `401` response without leaking secret data.
 2. A valid key reaches only routes covered by its scopes.
-3. A tenant cannot read or append tasks to another tenant's workflow.
+3. A tenant cannot read/append/seal another tenant's workflow, including when
+   the foreign workflow is expired or already sealed.
 4. The stored value is an HMAC, not the issued secret; application and audit
    logs contain neither secret nor Authorization header.
 5. During key rotation, both intended keys work; revoking the old key blocks it
@@ -174,12 +210,28 @@ use a process-local limiter as its multi-replica security boundary.
 6. Health remains unauthenticated and every task/workflow endpoint is covered
    by the middleware.
 7. A valid JSON body remains bindable after idempotency hashing and buffering.
-8. Concurrent identical POST retries create one workflow/job and one outbox
-   row, then return the same stored response.
-9. Reusing an idempotency key with a changed body or request path returns `409`.
+8. Concurrent identical POST retries create one draft workflow/job with no
+   publication; concurrent seal replay activates each root once and returns
+   the original stored response.
+9. Reusing a key with changed body bytes in the same tenant/method/path scope
+   returns `409`; the same key on a different path has an independent record.
+   A replay never bypasses current authorization or tenant ownership.
 10. The idempotency janitor deletes only expired rows in bounded batches.
 11. An oversized body returns `413` and an oversized idempotency key returns
     `400` before the handler or database write runs.
+12. Seal requires workflows:write and its own Idempotency-Key. Empty graph is
+    400, expired draft or different-key reseal is 409, foreign workflow is 404,
+    and unhealthy pinned routes are no-write 503. Same-key committed seal replay
+    succeeds despite later execution/worker-health changes.
+13. Append/seal/expiry races cannot execute a draft, lose an accepted child or
+    publish roots twice; expired drafts are cancelled with retained history.
+14. S3-03 result states and Base64 metadata follow the canonical contract;
+    no tasks:read scope or foreign tenant can obtain a result/grant.
+15. Expired/revoked grant reads are 401; a retained object may receive a fresh
+    grant. A tombstoned/expired object returns 410 and cannot receive a new
+    grant. Issuer-key revocation/scope removal also blocks an issued grant.
+16. Grant issuance versus tombstone respects deletion holds; responses are
+    no-store, no signed URL is logged/stored, and expired grant rows are pruned.
 
 ## Delivery order
 
@@ -187,12 +239,16 @@ use a process-local limiter as its multi-replica security boundary.
    bootstrap/issue command that prints the secret once.
 2. Add the constant-time key validator and Gin middleware.
 3. Thread tenant ownership and transactional POST idempotency through
-   workflow/task writes and reads.
+   draft workflow/task writes, seal activation and reads.
 4. Add the bounded idempotency janitor and its expiry index.
 5. Add authorization, cross-tenant, concurrent-retry, and janitor integration
    tests.
 6. Enforce TLS/ingress configuration and publish rotation/runbook guidance.
+7. In S3-03, add result union/download-grant routes under the same auth/tenant
+   boundary, with artifact issuer-key validation and C21 tests before enabling
+   object results. Worker TenantID is server-derived as required by C19.
 
 Do not issue API keys from an unauthenticated public endpoint, store secrets in
-environment variables, accept POST requests without `Idempotency-Key`, or use
+committed environment/config files, accept POST requests without
+`Idempotency-Key` after the transactional store is deployed, or use
 the REST API key for Worker Gateway calls.

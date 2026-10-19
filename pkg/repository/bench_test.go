@@ -6,11 +6,11 @@
 //
 // Run all benchmarks:
 //
-//	go test ./pkg/repository/ -run '^$' -bench=. -benchtime=20000x -count=1
+//	RUN_REPOSITORY_INTEGRATION=1 TEST_POSTGRES_CONN_STRING='postgres://...' go test ./pkg/repository/ -run '^$' -bench=. -benchtime=20000x -count=1
 //
 // Run only latency test:
 //
-//	go test ./pkg/repository/ -run TestEndToEndLatency -v -count=1
+//	RUN_REPOSITORY_INTEGRATION=1 RUN_LATENCY_BENCHMARK=1 TEST_POSTGRES_CONN_STRING='postgres://...' go test ./pkg/repository/ -run TestEndToEndLatency -v -count=1
 package repository_test
 
 import (
@@ -38,9 +38,16 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if os.Getenv("RUN_REPOSITORY_INTEGRATION") != "1" {
+		os.Exit(m.Run())
+	}
+	connString := os.Getenv("TEST_POSTGRES_CONN_STRING")
+	if connString == "" {
+		panic("TEST_POSTGRES_CONN_STRING is required when RUN_REPOSITORY_INTEGRATION=1")
+	}
 	cfg := config.PostgresConfig{
-		ConnString:            "postgres://postgres:password@localhost:5432/task_queue?sslmode=disable",
-		MaxConns:              20, // higher for parallel benchmarks
+		ConnString:            connString,
+		MaxConns:              20,
 		MinConns:              2,
 		MaxConnIdle:           5 * time.Minute,
 		MaxConnLifetime:       10 * time.Minute,
@@ -69,6 +76,13 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
+func requireRepositoryIntegration(tb testing.TB) {
+	tb.Helper()
+	if sharedRepo == nil {
+		tb.Skip("set RUN_REPOSITORY_INTEGRATION=1 and TEST_POSTGRES_CONN_STRING to run repository integration tests")
+	}
+}
+
 // getDeliveryID reads back the outbox delivery_id written by CreateJob.
 // In production this flows: outbox → relay → Redis message → worker.
 // In tests we read it directly to simulate what the worker receives.
@@ -85,6 +99,7 @@ func getDeliveryID(ctx context.Context, taskID uuid.UUID) (uuid.UUID, error) {
 
 // BenchmarkCreateWorkflow measures workflow creation throughput (serial).
 func BenchmarkCreateWorkflow(b *testing.B) {
+	requireRepositoryIntegration(b)
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -98,6 +113,7 @@ func BenchmarkCreateWorkflow(b *testing.B) {
 // BenchmarkCreateJob measures task creation throughput (serial).
 // Includes the full transactional outbox write — this is the honest API cost.
 func BenchmarkCreateJob(b *testing.B) {
+	requireRepositoryIntegration(b)
 	ctx := context.Background()
 	workflowID, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob")
 	if err != nil {
@@ -121,6 +137,7 @@ func BenchmarkCreateJob(b *testing.B) {
 // Reads back the outbox delivery_id to simulate what a real worker receives
 // from Redis after the relay publishes the outbox row.
 func BenchmarkTryStartJob(b *testing.B) {
+	requireRepositoryIntegration(b)
 	ctx := context.Background()
 	workflowID, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob")
 
@@ -160,6 +177,7 @@ func BenchmarkTryStartJob(b *testing.B) {
 // BenchmarkCascadingCancellation measures MarkAsCancelledCascading
 // with an 11-task chain (root + 10 children) per run.
 func BenchmarkCascadingCancellation(b *testing.B) {
+	requireRepositoryIntegration(b)
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -196,6 +214,7 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 // BenchmarkCreateJobParallel measures task creation under concurrent load.
 // Uses b.RunParallel with GOMAXPROCS goroutines sharing the connection pool.
 func BenchmarkCreateJobParallel(b *testing.B) {
+	requireRepositoryIntegration(b)
 	ctx := context.Background()
 	workflowID, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob-parallel")
 	if err != nil {
@@ -221,6 +240,7 @@ func BenchmarkCreateJobParallel(b *testing.B) {
 // BenchmarkTryStartJobParallel measures job claim throughput under concurrent load.
 // Pre-creates all tasks before the benchmark timer starts.
 func BenchmarkTryStartJobParallel(b *testing.B) {
+	requireRepositoryIntegration(b)
 	ctx := context.Background()
 	workflowID, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob-parallel")
 
@@ -272,6 +292,10 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 // CreateWorkflow + CreateJob (includes transactional outbox write).
 // Includes a warmup phase to avoid cold-start skew.
 func TestEndToEndLatency(t *testing.T) {
+	requireRepositoryIntegration(t)
+	if os.Getenv("RUN_LATENCY_BENCHMARK") != "1" {
+		t.Skip("set RUN_LATENCY_BENCHMARK=1 to run the latency benchmark")
+	}
 	ctx := context.Background()
 	const warmup = 20
 	const runs = 5000
@@ -318,4 +342,53 @@ func TestEndToEndLatency(t *testing.T) {
 	t.Logf("  p95: %v", durations[runs*95/100])
 	t.Logf("  p99: %v", durations[runs*99/100])
 	t.Logf("  max: %v", durations[runs-1])
+}
+
+func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
+	requireRepositoryIntegration(t)
+	ctx := context.Background()
+	workflowID, err := sharedRepo.CreateWorkflow(ctx, "recover-idle-delivery")
+	if err != nil {
+		t.Fatalf("create workflow: %v", err)
+	}
+	taskID := uuid.New()
+	if err := sharedRepo.CreateJob(ctx, "queue:recover", repository.Task{
+		ID: taskID, WorkflowID: workflowID, TaskType: "RECOVER", Payload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("create job: %v", err)
+	}
+	deliveryID, err := getDeliveryID(ctx, taskID)
+	if err != nil {
+		t.Fatalf("get delivery ID: %v", err)
+	}
+	if _, err := sharedRepo.TryStartJob(ctx, "queue:recover", taskID.String(), deliveryID.String(), 0, time.Minute); err != nil {
+		t.Fatalf("claim job: %v", err)
+	}
+
+	action, err := sharedRepo.RecoverIdleDelivery(ctx, "queue:recover", taskID.String(), 0)
+	if err != nil {
+		t.Fatalf("recover live lease: %v", err)
+	}
+	if action != repository.RecoveryKeepInflight {
+		t.Fatalf("live lease action = %v, want keep inflight", action)
+	}
+
+	if _, err := sharedPool.Exec(ctx, `UPDATE processed_jobs SET lease_expires_at = NOW() - INTERVAL '1 second' WHERE id = $1`, taskID); err != nil {
+		t.Fatalf("expire lease: %v", err)
+	}
+	action, err = sharedRepo.RecoverIdleDelivery(ctx, "queue:recover", taskID.String(), 0)
+	if err != nil {
+		t.Fatalf("recover expired lease: %v", err)
+	}
+	if action != repository.RecoveryRequeue {
+		t.Fatalf("expired lease action = %v, want requeue", action)
+	}
+
+	var recoveryDeliveries int
+	if err := sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM outbox WHERE task_id = $1 AND generation = 1`, taskID).Scan(&recoveryDeliveries); err != nil {
+		t.Fatalf("count recovery deliveries: %v", err)
+	}
+	if recoveryDeliveries != 1 {
+		t.Fatalf("recovery deliveries = %d, want 1", recoveryDeliveries)
+	}
 }
