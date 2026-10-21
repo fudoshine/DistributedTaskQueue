@@ -7,6 +7,11 @@ import (
 	"time"
 )
 
+const (
+	referenceEchoTaskType       = "reference.echo"
+	referenceEchoHandlerVersion = "v1"
+)
+
 var (
 	ErrUnknownTaskType = errors.New("unknown task type")
 )
@@ -116,32 +121,31 @@ func (e CatalogEntry) Validate() error {
 }
 
 type Catalog struct {
-	entries map[string]CatalogEntry
+	entries      map[string]CatalogEntry
+	taskTypes    map[capability]taskDefinition
+	payloadTypes map[schemaKey]payloadDefinition
+	resultTypes  map[schemaKey]resultDefinition
 }
 
 func NewCatalog() (*Catalog, error) {
-	catalog := &Catalog{
-		entries: map[string]CatalogEntry{
-			"reference.echo": {
-				TaskType:         "reference.echo",
-				HandlerVersion:   "v1",
-				RouteRevision:    1,
-				CapabilityStream: "queue:reference.echo:v1:r1:stream",
-				ExecutionPool:    "reference",
-				PayloadSchema: PayloadSchema{
-					ContentType: "application/json",
-					Name:        "reference.echo",
-					Version:     1,
-					MaxBytes:    1024,
-				},
-				ResultSchema: ResultSchema{
-					ContentType:    "text/plain",
-					Name:           "reference.echo",
-					Version:        1,
-					InlineMaxBytes: 1024,
-					ObjectMaxBytes: 0,
-					OutputRequired: true,
-				},
+	payload := payloadDefinition{
+		schema:   PayloadSchema{ContentType: "application/json", Name: referenceEchoTaskType, Version: 1, MaxBytes: 1024},
+		validate: validateEchoPayload,
+	}
+	result := resultDefinition{
+		schema:   ResultSchema{ContentType: "text/plain", Name: referenceEchoTaskType, Version: 1, OutputRequired: true, InlineMaxBytes: 1024},
+		validate: validateEchoResult,
+	}
+	return newCatalog(
+		[]CatalogEntry{
+			{
+				TaskType:           referenceEchoTaskType,
+				HandlerVersion:     referenceEchoHandlerVersion,
+				RouteRevision:      1,
+				CapabilityStream:   "queue:reference.echo:v1:r1:stream",
+				ExecutionPool:      "reference",
+				PayloadSchema:      payload.schema,
+				ResultSchema:       result.schema,
 				LeaseTTL:           20 * time.Second,
 				HeartbeatEvery:     5 * time.Second,
 				HandlerTimeout:     20 * time.Second,
@@ -160,13 +164,9 @@ func NewCatalog() (*Catalog, error) {
 				EffectStrategy: "none",
 			},
 		},
-	}
-	for _, entry := range catalog.entries {
-		if err := entry.Validate(); err != nil {
-			return nil, err
-		}
-	}
-	return catalog, nil
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
 }
 
 func (c *Catalog) Lookup(taskType string) (CatalogEntry, error) {
