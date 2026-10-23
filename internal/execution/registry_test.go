@@ -1,6 +1,9 @@
 package execution
 
-import "testing"
+import (
+	"encoding/json"
+	"testing"
+)
 
 func TestNewCatalogRejectsMissingPayloadValidator(t *testing.T) {
 	definition := payloadDefinition{
@@ -45,5 +48,203 @@ func TestNewCatalogRejectsDuplicatePayloadSchema(t *testing.T) {
 	}
 	if catalog != nil {
 		t.Fatalf("Expected empty as it was invalide input %v", catalog)
+	}
+}
+
+func TestNewCatalogRejectsSharedCapabilityStream(t *testing.T) {
+	catalogEntry, err := NewCatalog()
+	if err != nil {
+		t.Fatalf("Something went wrong in initializing contructor of catalog %v", err)
+	}
+	first, err := catalogEntry.Lookup("reference.echo")
+	if err != nil {
+		t.Fatalf("Getting error during lookup of correct entry %v", err)
+	}
+	payload := payloadDefinition{
+		schema:   first.PayloadSchema,
+		validate: validateEchoPayload,
+	}
+	result := resultDefinition{
+		schema:   first.ResultSchema,
+		validate: validateEchoResult,
+	}
+	second := first
+	second.RouteRevision++
+	catalog, err := newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err == nil {
+		t.Fatalf("Expected error but got passed %v", catalog)
+	}
+	if catalog != nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+	second.CapabilityStream = "queue:reference.echo:v1:r2:stream"
+	catalog, err = newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err != nil {
+		t.Fatalf("expected successful construction: %v", err)
+	}
+	if catalog == nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+	second.RouteRevision = first.RouteRevision
+	second.PayloadSchema.Version++
+	catalog, err = newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err == nil {
+		t.Fatalf("Expected error but got passed %v", catalog)
+	}
+	if catalog != nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+
+	second.PayloadSchema.Version--
+	second.ResultSchema.Version++
+	catalog, err = newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err == nil {
+		t.Fatalf("Expected error but got passed %v", catalog)
+	}
+	if catalog != nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+	second = first
+	second.HandlerVersion = "v2"
+	catalog, err = newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err == nil {
+		t.Fatalf("Expected error but got passed %v", catalog)
+	}
+	if catalog != nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+	second.CapabilityStream = "queue:reference.echo:v2:r1:stream"
+	catalog, err = newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err != nil {
+		t.Fatalf("expected successful construction: %v", err)
+	}
+	if catalog == nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+
+}
+func TestNewCatalogRejectsDuplicateRoute(t *testing.T) {
+	catalogEntry, err := NewCatalog()
+	if err != nil {
+		t.Fatalf("Something went wrong in initializing contructor of catalog %v", err)
+	}
+	first, err := catalogEntry.Lookup("reference.echo")
+	if err != nil {
+		t.Fatalf("Getting error during lookup of correct entry %v", err)
+	}
+	payload := payloadDefinition{
+		schema:   first.PayloadSchema,
+		validate: validateEchoPayload,
+	}
+	result := resultDefinition{
+		schema:   first.ResultSchema,
+		validate: validateEchoResult,
+	}
+	second := first
+	second.CapabilityStream = first.CapabilityStream + ":other"
+	catalog, err := newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err == nil {
+		t.Fatalf("Expected error but got passed %v", catalog)
+	}
+	if catalog != nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+
+	second.RouteRevision++
+	catalog, err = newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload},
+		[]resultDefinition{result},
+	)
+	if err != nil {
+		t.Fatalf("expected successful construction: %v", err)
+	}
+	if catalog == nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+}
+func TestNewCatalogRequiresNewHandlerForSchemaChange(t *testing.T) {
+	catalogEntry, err := NewCatalog()
+	if err != nil {
+		t.Fatalf("Something went wrong in initializing contructor of catalog %v", err)
+	}
+	first, err := catalogEntry.Lookup("reference.echo")
+	if err != nil {
+		t.Fatalf("Getting error during lookup of correct entry %v", err)
+	}
+	payload := payloadDefinition{
+		schema:   first.PayloadSchema,
+		validate: validateEchoPayload,
+	}
+	result := resultDefinition{
+		schema:   first.ResultSchema,
+		validate: validateEchoResult,
+	}
+	payloadV2 := payload
+	payloadV2.schema.Version++
+
+	second := first
+	second.RouteRevision++
+	second.CapabilityStream = first.CapabilityStream + ":next"
+	second.PayloadSchema = payloadV2.schema
+
+	catalog, err := newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload, payloadV2},
+		[]resultDefinition{result},
+	)
+	if err == nil {
+		t.Fatalf("Expected error but got passed %v", catalog)
+	}
+	if catalog != nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+	second.HandlerVersion = "v2"
+
+	catalog, err = newCatalog(
+		[]CatalogEntry{first, second},
+		[]payloadDefinition{payload, payloadV2},
+		[]resultDefinition{result},
+	)
+	if err != nil {
+		t.Fatalf("expected successful construction: %v", err)
+	}
+	if catalog == nil {
+		t.Fatalf("Expected no value when got error but getting value %v", catalog)
+	}
+	err = catalog.ValidatePayload(
+		first,
+		json.RawMessage(`{"message":"old job"}`),
+	)
+	if err != nil {
+		t.Fatalf("Expected succesfully contructor intialization but got error %v", err)
 	}
 }
