@@ -316,8 +316,8 @@ func runProducer(ctx context.Context, queueName string, interval time.Duration, 
 			var workflowID uuid.UUID
 			err := retryWithBackoff(ctx, 3, func() error {
 				return dbBreaker.Call(func() error {
-					var e error
-					workflowID, e = jobs.CreateWorkflow(ctx, fmt.Sprintf("video-pipeline-%d", n))
+					workflow, e := jobs.CreateWorkflow(ctx, fmt.Sprintf("video-pipeline-%d", n))
+					workflowID=workflow.ID
 					return e
 				})
 			})

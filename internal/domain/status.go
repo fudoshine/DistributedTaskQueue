@@ -8,11 +8,12 @@ const (
 	WorkflowStatusCompleted WorkflowStatus = "COMPLETED"
 	WorkflowStatusFailed    WorkflowStatus = "FAILED"
 	WorkflowStatusCancelled WorkflowStatus = "CANCELLED"
+	WorkflowStatusDraft     WorkflowStatus = "DRAFT"
 )
 
 func (s WorkflowStatus) IsValid() bool {
 	switch s {
-	case WorkflowStatusCompleted, WorkflowStatusFailed, WorkflowStatusRunning, WorkflowStatusCancelled, WorkflowStatusPending:
+	case WorkflowStatusCompleted, WorkflowStatusFailed, WorkflowStatusRunning, WorkflowStatusCancelled, WorkflowStatusPending, WorkflowStatusDraft:
 		return true
 	}
 	return false

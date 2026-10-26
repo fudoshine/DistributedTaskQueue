@@ -3,6 +3,7 @@ package repository
 import (
 	"context"
 	"distributed-queue/internal/domain"
+	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/redis/metrics"
 	"encoding/json"
 	"errors"
@@ -46,24 +47,30 @@ type Task struct {
 	MaxRetries int // 0 means "use the schema default (3)"
 }
 type Workflow struct {
-	ID        uuid.UUID
-	Name      string
-	Status    domain.WorkflowStatus
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	ID             uuid.UUID
+	Name           string
+	Status         domain.WorkflowStatus
+	TenantID       *uuid.UUID
+	SealedAt       *time.Time
+	DraftExpiresAt *time.Time
+	CreatedAt      time.Time
+	UpdatedAt      time.Time
 }
 type JobRow struct {
-	ID             uuid.UUID
-	WorkflowID     uuid.UUID
-	ParentIDs      []uuid.UUID
-	TaskType       string
-	Status         domain.TaskStatus
-	CurrentRetries int
-	MaxRetries     int
-	ErrorLog       *string
-	CreatedAt      time.Time
-	ProcessedAt    *time.Time
-	AvailableAt    time.Time
+	ID                uuid.UUID
+	WorkflowID        uuid.UUID
+	ParentIDs         []uuid.UUID
+	TaskType          string
+	TenantID          *uuid.UUID
+	ExecutionContract *execution.CatalogEntry
+	EffectKey         *uuid.UUID
+	Status            domain.TaskStatus
+	CurrentRetries    int
+	MaxRetries        int
+	ErrorLog          *string
+	CreatedAt         time.Time
+	ProcessedAt       *time.Time
+	AvailableAt       time.Time
 }
 type JobRepository struct {
 	pool *pgxpool.Pool
@@ -109,19 +116,20 @@ func NewJobRepository(pool *pgxpool.Pool) *JobRepository {
 // Call this once per logical batch of related tasks before creating the
 // tasks themselves, since processed_jobs.workflow_id is NOT NULL with a
 // foreign key into workflows.
-func (r *JobRepository) CreateWorkflow(ctx context.Context, name string) (uuid.UUID, error) {
-	var id uuid.UUID
+func (r *JobRepository) CreateWorkflow(ctx context.Context, name string) (Workflow, error) {
+	var workflow Workflow
 	query := `
 		INSERT INTO workflows (name, status)
 		VALUES ($1, $2)
-		RETURNING id;
+		RETURNING id, name, sealed_at, status, tenant_id,
+          created_at, updated_at, draft_expires_at;
 	`
-	if err := r.pool.QueryRow(ctx, query, name, domain.WorkflowStatusPending).Scan(&id); err != nil {
+	if err := r.pool.QueryRow(ctx, query, name, domain.WorkflowStatusPending).Scan(&workflow.ID, &workflow.Name, &workflow.SealedAt, &workflow.Status, &workflow.TenantID, &workflow.CreatedAt, &workflow.UpdatedAt, &workflow.DraftExpiresAt); err != nil {
 		metrics.JobRepoErrors.WithLabelValues("_workflow", "CreateWorkflow").Inc()
-		return uuid.Nil, fmt.Errorf("failed to create workflow %q: %w", name, err)
+		return Workflow{}, fmt.Errorf("failed to create workflow %q: %w", name, err)
 	}
 	metrics.WorkflowsCreated.Inc()
-	return id, nil
+	return workflow, nil
 }
 
 // CreateJob inserts a processed_jobs row before its ID can be published to
@@ -896,8 +904,11 @@ func (r *JobRepository) GetWorkflow(ctx context.Context, workflowID uuid.UUID) (
 	}
 
 	var workflow Workflow
-	query := `SELECT id, name, status, created_at,updated_at FROM workflows WHERE id = $1;`
-	err := r.pool.QueryRow(ctx, query, workflowID).Scan(&workflow.ID, &workflow.Name, &workflow.Status, &workflow.CreatedAt, &workflow.UpdatedAt)
+	query := `SELECT id, name, status, tenant_id, sealed_at, draft_expires_at,
+				created_at, updated_at
+				FROM workflows
+				WHERE id = $1;`
+	err := r.pool.QueryRow(ctx, query, workflowID).Scan(&workflow.ID, &workflow.Name, &workflow.Status, &workflow.TenantID, &workflow.SealedAt, &workflow.DraftExpiresAt, &workflow.CreatedAt, &workflow.UpdatedAt)
 	if err != nil {
 		return Workflow{}, fmt.Errorf("failed to get workflow for ID %s: %w", workflowID, err)
 	}
@@ -910,12 +921,14 @@ func (r *JobRepository) GetTask(ctx context.Context, taskID uuid.UUID) (JobRow, 
 	}
 
 	var task JobRow
-	query := `SELECT id, workflow_id, task_type, status, current_retries, max_retries,
+	query := `SELECT id, workflow_id, task_type, tenant_id, execution_contract, effect_key, status, current_retries, max_retries,
           error_log, created_at, processed_at, available_at
 		  FROM processed_jobs
 		  WHERE id = $1;`
 	err := r.pool.QueryRow(ctx, query, taskID).Scan(
-		&task.ID, &task.WorkflowID, &task.TaskType, &task.Status,
+		&task.ID, &task.WorkflowID, &task.TaskType,
+		&task.TenantID, &task.ExecutionContract, &task.EffectKey,
+		&task.Status,
 		&task.CurrentRetries, &task.MaxRetries,
 		&task.ErrorLog, &task.CreatedAt, &task.ProcessedAt, &task.AvailableAt,
 	)

@@ -4,24 +4,39 @@ import (
 	"context"
 	"distributed-queue/internal/api"
 	"distributed-queue/internal/domain"
+	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/repository"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"time"
 
 	"github.com/google/uuid"
 )
 
+var ErrInvalidTaskInput = errors.New("invalid task input")
+
 type TaskService struct {
-	repo *repository.JobRepository
+	repo    *repository.JobRepository
+	catalog *execution.Catalog
 }
 
-func NewTaskService(repo *repository.JobRepository) *TaskService {
+func NewTaskService(repo *repository.JobRepository, catalog *execution.Catalog) *TaskService {
 	return &TaskService{
-		repo: repo,
+		repo:    repo,
+		catalog: catalog,
 	}
 }
 
 func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflowID uuid.UUID, parentIDs []uuid.UUID, taskType string, payload json.RawMessage, maxRetries int) (api.TaskResponse, error) {
+	entry, err := s.catalog.Lookup(taskType)
+	if err != nil {
+		return api.TaskResponse{}, fmt.Errorf("%w: %w", ErrInvalidTaskInput, err)
+	}
+	if err := s.catalog.ValidatePayload(entry, payload); err != nil {
+		return api.TaskResponse{}, fmt.Errorf("%w: %w", ErrInvalidTaskInput, err)
+	}
+
 	taskID := uuid.New()
 	task := repository.Task{
 		ID:         taskID,
@@ -31,7 +46,7 @@ func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflow
 		Payload:    payload,
 		MaxRetries: maxRetries,
 	}
-	err := s.repo.CreateJob(ctx, queueName, task)
+	err = s.repo.CreateJob(ctx, queueName, task)
 	if err != nil {
 		return api.TaskResponse{}, err
 	}

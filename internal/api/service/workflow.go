@@ -3,9 +3,7 @@ package service
 import (
 	"context"
 	"distributed-queue/internal/api"
-	"distributed-queue/internal/domain"
 	"distributed-queue/pkg/repository"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -21,16 +19,18 @@ func NewWorkflowService(repo *repository.JobRepository) *WorkflowService {
 }
 
 func (s *WorkflowService) CreateWorkflow(ctx context.Context, workflowName string) (*api.WorkflowResponse, error) {
-	id, err := s.repo.CreateWorkflow(ctx, workflowName)
+	workflow, err := s.repo.CreateWorkflow(ctx, workflowName)
 	if err != nil {
 		return nil, err
 	}
 	return &api.WorkflowResponse{
-		ID:        id,
-		Name:      workflowName,
-		Status:    domain.WorkflowStatusPending,
-		CreatedAt: time.Now(),
-		UpdatedAt: time.Now(),
+		ID:             workflow.ID,
+		Name:           workflow.Name,
+		Status:         workflow.Status,
+		SealedAt:       workflow.SealedAt,
+		DraftExpiresAt: workflow.DraftExpiresAt,
+		CreatedAt:      workflow.CreatedAt,
+		UpdatedAt:      workflow.UpdatedAt,
 	}, nil
 }
 
@@ -40,10 +40,12 @@ func (s *WorkflowService) GetWorkflow(ctx context.Context, workflowID uuid.UUID)
 		return nil, err
 	}
 	return &api.WorkflowResponse{
-		ID:        res.ID,
-		Name:      res.Name,
-		CreatedAt: res.CreatedAt,
-		UpdatedAt: res.UpdatedAt,
-		Status:    res.Status,
+		ID:             res.ID,
+		Name:           res.Name,
+		SealedAt:       res.SealedAt,
+		DraftExpiresAt: res.DraftExpiresAt,
+		CreatedAt:      res.CreatedAt,
+		UpdatedAt:      res.UpdatedAt,
+		Status:         res.Status,
 	}, nil
 }

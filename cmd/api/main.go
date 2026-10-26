@@ -5,6 +5,7 @@ import (
 	apiserver "distributed-queue/internal/api"
 	v1 "distributed-queue/internal/api/handlers/v1"
 	"distributed-queue/internal/api/service"
+	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/config"
 	"distributed-queue/pkg/repository"
 	"log/slog"
@@ -34,9 +35,13 @@ func main() {
 	defer pool.Close()
 
 	jobRepo := repository.NewJobRepository(pool)
-
+	catalog, err := execution.NewCatalog()
+	if err != nil {
+		slog.Error("failed to initialize catalog", "error", err)
+		return
+	}
 	workflowSvc := service.NewWorkflowService(jobRepo)
-	taskSvc := service.NewTaskService(jobRepo)
+	taskSvc := service.NewTaskService(jobRepo, catalog)
 
 	workflowHandler := v1.NewWorkflowHandler(workflowSvc)
 	taskHandler := v1.NewTaskHandler(taskSvc, cfg.Queue.Name)

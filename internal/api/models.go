@@ -23,11 +23,13 @@ type CreateTaskRequest struct {
 }
 
 type WorkflowResponse struct {
-	ID        uuid.UUID             `json:"id"`
-	Name      string                `json:"name"`
-	Status    domain.WorkflowStatus `json:"status"`
-	CreatedAt time.Time             `json:"created_at"`
-	UpdatedAt time.Time             `json:"updated_at"`
+	ID             uuid.UUID             `json:"id"`
+	Name           string                `json:"name"`
+	Status         domain.WorkflowStatus `json:"status"`
+	SealedAt       *time.Time            `json:"sealed_at"`
+	DraftExpiresAt *time.Time            `json:"draft_expires_at"`
+	CreatedAt      time.Time             `json:"created_at"`
+	UpdatedAt      time.Time             `json:"updated_at"`
 }
 
 type TaskResponse struct {

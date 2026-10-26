@@ -76,7 +76,7 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func requireRepositoryIntegration(tb testing.TB) {
+func RequireRepositoryIntegration(tb testing.TB) {
 	tb.Helper()
 	if sharedRepo == nil {
 		tb.Skip("set RUN_REPOSITORY_INTEGRATION=1 and TEST_POSTGRES_CONN_STRING to run repository integration tests")
@@ -99,7 +99,7 @@ func getDeliveryID(ctx context.Context, taskID uuid.UUID) (uuid.UUID, error) {
 
 // BenchmarkCreateWorkflow measures workflow creation throughput (serial).
 func BenchmarkCreateWorkflow(b *testing.B) {
-	requireRepositoryIntegration(b)
+	RequireRepositoryIntegration(b)
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -113,12 +113,13 @@ func BenchmarkCreateWorkflow(b *testing.B) {
 // BenchmarkCreateJob measures task creation throughput (serial).
 // Includes the full transactional outbox write — this is the honest API cost.
 func BenchmarkCreateJob(b *testing.B) {
-	requireRepositoryIntegration(b)
+	RequireRepositoryIntegration(b)
 	ctx := context.Background()
-	workflowID, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob")
+	workflow, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob")
 	if err != nil {
 		b.Fatalf("create workflow: %v", err)
 	}
+	workflowID := workflow.ID
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
@@ -137,10 +138,10 @@ func BenchmarkCreateJob(b *testing.B) {
 // Reads back the outbox delivery_id to simulate what a real worker receives
 // from Redis after the relay publishes the outbox row.
 func BenchmarkTryStartJob(b *testing.B) {
-	requireRepositoryIntegration(b)
+	RequireRepositoryIntegration(b)
 	ctx := context.Background()
-	workflowID, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob")
-
+	workflow, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob")
+	workflowID := workflow.ID
 	type entry struct {
 		taskID     uuid.UUID
 		deliveryID uuid.UUID
@@ -177,12 +178,13 @@ func BenchmarkTryStartJob(b *testing.B) {
 // BenchmarkCascadingCancellation measures MarkAsCancelledCascading
 // with an 11-task chain (root + 10 children) per run.
 func BenchmarkCascadingCancellation(b *testing.B) {
-	requireRepositoryIntegration(b)
+	RequireRepositoryIntegration(b)
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		b.StopTimer()
-		workflowID, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("cancel-bench-%d", i))
+		workflow, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("cancel-bench-%d", i))
+		workflowID := workflow.ID
 		rootID := uuid.New()
 		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: rootID, WorkflowID: workflowID,
@@ -214,12 +216,13 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 // BenchmarkCreateJobParallel measures task creation under concurrent load.
 // Uses b.RunParallel with GOMAXPROCS goroutines sharing the connection pool.
 func BenchmarkCreateJobParallel(b *testing.B) {
-	requireRepositoryIntegration(b)
+	RequireRepositoryIntegration(b)
 	ctx := context.Background()
-	workflowID, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob-parallel")
+	workflow, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob-parallel")
 	if err != nil {
 		b.Fatalf("create workflow: %v", err)
 	}
+	workflowID := workflow.ID
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
@@ -240,10 +243,10 @@ func BenchmarkCreateJobParallel(b *testing.B) {
 // BenchmarkTryStartJobParallel measures job claim throughput under concurrent load.
 // Pre-creates all tasks before the benchmark timer starts.
 func BenchmarkTryStartJobParallel(b *testing.B) {
-	requireRepositoryIntegration(b)
+	RequireRepositoryIntegration(b)
 	ctx := context.Background()
-	workflowID, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob-parallel")
-
+	workflow, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob-parallel")
+	workflowID := workflow.ID
 	type entry struct {
 		taskID     uuid.UUID
 		deliveryID uuid.UUID
@@ -292,7 +295,7 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 // CreateWorkflow + CreateJob (includes transactional outbox write).
 // Includes a warmup phase to avoid cold-start skew.
 func TestEndToEndLatency(t *testing.T) {
-	requireRepositoryIntegration(t)
+	RequireRepositoryIntegration(t)
 	if os.Getenv("RUN_LATENCY_BENCHMARK") != "1" {
 		t.Skip("set RUN_LATENCY_BENCHMARK=1 to run the latency benchmark")
 	}
@@ -302,7 +305,8 @@ func TestEndToEndLatency(t *testing.T) {
 
 	// warmup — not measured
 	for i := 0; i < warmup; i++ {
-		wid, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("warmup-%d", i))
+		workflow, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("warmup-%d", i))
+		wid := workflow.ID
 		_ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: uuid.New(), WorkflowID: wid,
 			TaskType: "WARMUP", Payload: json.RawMessage(`{}`),
@@ -312,13 +316,13 @@ func TestEndToEndLatency(t *testing.T) {
 	durations := make([]time.Duration, runs)
 	for i := 0; i < runs; i++ {
 		start := time.Now()
-		workflowID, err := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("latency-test-%d", i))
+		workflow, err := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("latency-test-%d", i))
 		if err != nil {
 			t.Fatalf("create workflow: %v", err)
 		}
 		if err = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID:         uuid.New(),
-			WorkflowID: workflowID,
+			WorkflowID: workflow.ID,
 			TaskType:   "LATENCY_TEST",
 			Payload:    json.RawMessage(`{}`),
 		}); err != nil {
@@ -345,12 +349,13 @@ func TestEndToEndLatency(t *testing.T) {
 }
 
 func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
-	requireRepositoryIntegration(t)
+	RequireRepositoryIntegration(t)
 	ctx := context.Background()
-	workflowID, err := sharedRepo.CreateWorkflow(ctx, "recover-idle-delivery")
+	workflow, err := sharedRepo.CreateWorkflow(ctx, "recover-idle-delivery")
 	if err != nil {
 		t.Fatalf("create workflow: %v", err)
 	}
+	workflowID := workflow.ID
 	taskID := uuid.New()
 	if err := sharedRepo.CreateJob(ctx, "queue:recover", repository.Task{
 		ID: taskID, WorkflowID: workflowID, TaskType: "RECOVER", Payload: json.RawMessage(`{}`),

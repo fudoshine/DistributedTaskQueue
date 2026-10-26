@@ -3,6 +3,7 @@ package v1
 import (
 	"distributed-queue/internal/api"
 	"distributed-queue/internal/api/service"
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
@@ -39,7 +40,11 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 	}
 	task, err := h.taskSvc.CreateTask(c.Request.Context(), queueName, workflowID, req.ParentIDs, req.TaskType, req.Payload, req.MaxRetries)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		status := http.StatusInternalServerError
+		if errors.Is(err, service.ErrInvalidTaskInput) {
+			status = http.StatusBadRequest
+		}
+		c.JSON(status, gin.H{"error": err.Error()})
 		return
 	}
 	c.JSON(http.StatusCreated, task)
