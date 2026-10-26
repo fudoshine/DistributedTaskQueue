@@ -3,13 +3,11 @@ package service
 import (
 	"context"
 	"distributed-queue/internal/api"
-	"distributed-queue/internal/domain"
 	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/repository"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 )
@@ -46,25 +44,27 @@ func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflow
 		Payload:    payload,
 		MaxRetries: maxRetries,
 	}
-	err = s.repo.CreateJob(ctx, queueName, task)
+	stored, err := s.repo.CreateJob(ctx, queueName, task)
 	if err != nil {
 		return api.TaskResponse{}, err
 	}
 	return api.TaskResponse{
-		ID:         taskID,
-		WorkflowID: workflowID,
+		ID:         stored.ID,
+		WorkflowID: stored.WorkflowID,
 		ParentIDs: func() []uuid.UUID {
-			if parentIDs == nil {
+			if stored.ParentIDs == nil {
 				return []uuid.UUID{}
 			}
-			return parentIDs
+			return stored.ParentIDs
 		}(),
-		TaskType:       taskType,
-		Status:         domain.TaskStatusPending,
-		CurrentRetries: 0,
-		MaxRetries:     maxRetries,
-		CreatedAt:      time.Now(),
-		AvailableAt:    time.Now(),
+		TaskType:       stored.TaskType,
+		Status:         stored.Status,
+		CurrentRetries: stored.CurrentRetries,
+		MaxRetries:     stored.MaxRetries,
+		ErrorLog:       stored.ErrorLog,
+		CreatedAt:      stored.CreatedAt,
+		ProcessedAt:    stored.ProcessedAt,
+		AvailableAt:    stored.AvailableAt,
 	}, nil
 }
 

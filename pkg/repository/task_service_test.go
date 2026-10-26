@@ -4,12 +4,14 @@ import (
 	"distributed-queue/internal/api"
 	v1 "distributed-queue/internal/api/handlers/v1"
 	"distributed-queue/internal/api/service"
+	"distributed-queue/internal/domain"
 	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/repository"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -76,6 +78,7 @@ func TestTaskServiceCreateTask(t *testing.T) {
 				if stored.WorkflowID != workflow.ID || stored.TaskType != tc.taskType {
 					t.Fatalf("unexpected stored task: %+v", stored)
 				}
+				assertTaskResponseMatchesStored(t, result, stored)
 				added = 1
 			}
 			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
@@ -110,7 +113,7 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 		{"unknown type", `{"task_type":"email.send","payload":{"message":"hello"}}`, http.StatusBadRequest, false},
 		{"invalid payload", `{"task_type":"reference.echo","payload":{"message":42}}`, http.StatusBadRequest, false},
 		{"database failure", `{"task_type":"reference.echo","payload":{"message":"hello"}}`, http.StatusInternalServerError, true},
-		{"valid echo", `{"task_type":"reference.echo","payload":{"message":"hello"},"max_retries":3}`, http.StatusCreated, false},
+		{"valid echo", `{"task_type":"reference.echo","payload":{"message":"hello"}}`, http.StatusCreated, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testRouter := router
@@ -145,6 +148,10 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 				if stored.WorkflowID != workflow.ID || stored.TaskType != "reference.echo" {
 					t.Fatalf("unexpected stored task: %+v", stored)
 				}
+				assertTaskResponseMatchesStored(t, result, stored)
+				if result.MaxRetries != 3 {
+					t.Fatalf("expected persisted retry default 3, got %d", result.MaxRetries)
+				}
 				added = 1
 			} else {
 				var result api.ErrorResponse
@@ -158,6 +165,76 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 					beforeJobs, beforeOutbox, afterJobs, afterOutbox, added, added)
 			}
 		})
+	}
+}
+
+func TestTaskCreationReturnsPersistedState(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	catalog, err := execution.NewCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := service.NewTaskService(sharedRepo, catalog)
+	workflow, err := sharedRepo.CreateWorkflow(t.Context(), "persisted task responses")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var parentID uuid.UUID
+	for _, tc := range []struct {
+		name       string
+		dependent  bool
+		maxRetries int
+		wantMax    int
+		wantStatus domain.TaskStatus
+	}{
+		{"root with default retries", false, 0, 3, domain.TaskStatusQueued},
+		{"child with explicit retries", true, 7, 7, domain.TaskStatusPending},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var parents []uuid.UUID
+			if tc.dependent {
+				parents = []uuid.UUID{parentID}
+			}
+			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
+			result, err := svc.CreateTask(t.Context(), "queue:service-test", workflow.ID, parents,
+				"reference.echo", json.RawMessage(`{"message":"hello"}`), tc.maxRetries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			stored, err := sharedRepo.GetTask(t.Context(), result.ID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			assertTaskResponseMatchesStored(t, result, stored)
+			if result.MaxRetries != tc.wantMax || result.Status != tc.wantStatus || !slices.Equal(result.ParentIDs, parents) {
+				t.Fatalf("unexpected defaults, status or parents: %+v", result)
+			}
+			if !tc.dependent {
+				parentID = result.ID
+			}
+			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
+			wantOutbox := beforeOutbox
+			if !tc.dependent {
+				wantOutbox++
+			}
+			if afterJobs != beforeJobs+1 || afterOutbox != wantOutbox {
+				t.Fatalf("unexpected job/outbox counts: %d/%d", afterJobs, afterOutbox)
+			}
+		})
+	}
+}
+
+func assertTaskResponseMatchesStored(t *testing.T, result api.TaskResponse, stored repository.JobRow) {
+	t.Helper()
+	sameError := result.ErrorLog == nil && stored.ErrorLog == nil ||
+		result.ErrorLog != nil && stored.ErrorLog != nil && *result.ErrorLog == *stored.ErrorLog
+	sameProcessed := result.ProcessedAt == nil && stored.ProcessedAt == nil ||
+		result.ProcessedAt != nil && stored.ProcessedAt != nil && result.ProcessedAt.Equal(*stored.ProcessedAt)
+	if result.ID != stored.ID || result.WorkflowID != stored.WorkflowID || result.TaskType != stored.TaskType ||
+		result.Status != stored.Status || result.CurrentRetries != stored.CurrentRetries || result.MaxRetries != stored.MaxRetries ||
+		!slices.Equal(result.ParentIDs, stored.ParentIDs) || !sameError || !sameProcessed ||
+		!result.CreatedAt.Equal(stored.CreatedAt) || !result.AvailableAt.Equal(stored.AvailableAt) {
+		t.Fatalf("response differs from persisted task: response=%+v stored=%+v", result, stored)
 	}
 }
 

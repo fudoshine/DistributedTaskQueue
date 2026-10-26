@@ -3,11 +3,56 @@ package repository_test
 import (
 	"context"
 	"distributed-queue/internal/execution"
+	"distributed-queue/pkg/repository"
 	"encoding/json"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 )
+
+func TestCreateJobReturnsEmptyRowOnRollback(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	workflow, err := sharedRepo.CreateWorkflow(t.Context(), "create rollback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := sharedRepo.CreateJob(t.Context(), "queue:test", repository.Task{
+		ID: uuid.New(), WorkflowID: workflow.ID, TaskType: "reference.echo",
+		Payload: json.RawMessage(`{"message":"parent"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		queue   string
+		parents []uuid.UUID
+	}{
+		{"dependency failure after inserting an edge", "queue:test", []uuid.UUID{parent.ID, uuid.New()}},
+		{"outbox failure", strings.Repeat("q", 256), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
+			result, err := sharedRepo.CreateJob(t.Context(), tc.queue, repository.Task{
+				ID: uuid.New(), WorkflowID: workflow.ID, ParentIDs: tc.parents,
+				TaskType: "reference.echo", Payload: json.RawMessage(`{"message":"hello"}`),
+			})
+			if err == nil {
+				t.Fatal("expected job creation to fail")
+			}
+			if !reflect.DeepEqual(result, repository.JobRow{}) {
+				t.Fatalf("failed transaction returned a job: %+v", result)
+			}
+			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
+			if afterJobs != beforeJobs || afterOutbox != beforeOutbox {
+				t.Fatalf("failed creation changed job/outbox counts: %d/%d -> %d/%d",
+					beforeJobs, beforeOutbox, afterJobs, afterOutbox)
+			}
+		})
+	}
+}
 
 func TestTaskInsertion(t *testing.T) {
 	RequireRepositoryIntegration(t)

@@ -122,7 +122,7 @@ func BenchmarkCreateJob(b *testing.B) {
 	workflowID := workflow.ID
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID:         uuid.New(),
 			WorkflowID: workflowID,
 			TaskType:   "BENCH_TASK",
@@ -149,7 +149,7 @@ func BenchmarkTryStartJob(b *testing.B) {
 	entries := make([]entry, b.N)
 	for i := 0; i < b.N; i++ {
 		taskID := uuid.New()
-		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: taskID, WorkflowID: workflowID,
 			TaskType: "BENCH", Payload: json.RawMessage(`{}`),
 		}); err != nil {
@@ -186,7 +186,7 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 		workflow, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("cancel-bench-%d", i))
 		workflowID := workflow.ID
 		rootID := uuid.New()
-		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: rootID, WorkflowID: workflowID,
 			TaskType: "ROOT", Payload: json.RawMessage(`{}`),
 		}); err != nil {
@@ -195,7 +195,7 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 		prevID := rootID
 		for j := 0; j < 10; j++ {
 			childID := uuid.New()
-			if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+			if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 				ID: childID, WorkflowID: workflowID,
 				ParentIDs: []uuid.UUID{prevID},
 				TaskType:  "CHILD", Payload: json.RawMessage(`{}`),
@@ -226,7 +226,7 @@ func BenchmarkCreateJobParallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+			if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 				ID:         uuid.New(),
 				WorkflowID: workflowID,
 				TaskType:   "BENCH_TASK",
@@ -254,7 +254,7 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 	entries := make([]entry, b.N)
 	for i := 0; i < b.N; i++ {
 		taskID := uuid.New()
-		if err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: taskID, WorkflowID: workflowID,
 			TaskType: "BENCH", Payload: json.RawMessage(`{}`),
 		}); err != nil {
@@ -307,7 +307,7 @@ func TestEndToEndLatency(t *testing.T) {
 	for i := 0; i < warmup; i++ {
 		workflow, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("warmup-%d", i))
 		wid := workflow.ID
-		_ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		_, _ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID: uuid.New(), WorkflowID: wid,
 			TaskType: "WARMUP", Payload: json.RawMessage(`{}`),
 		})
@@ -320,7 +320,7 @@ func TestEndToEndLatency(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create workflow: %v", err)
 		}
-		if err = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		if _, err = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ID:         uuid.New(),
 			WorkflowID: workflow.ID,
 			TaskType:   "LATENCY_TEST",
@@ -357,7 +357,7 @@ func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
 	}
 	workflowID := workflow.ID
 	taskID := uuid.New()
-	if err := sharedRepo.CreateJob(ctx, "queue:recover", repository.Task{
+	if _, err := sharedRepo.CreateJob(ctx, "queue:recover", repository.Task{
 		ID: taskID, WorkflowID: workflowID, TaskType: "RECOVER", Payload: json.RawMessage(`{}`),
 	}); err != nil {
 		t.Fatalf("create job: %v", err)

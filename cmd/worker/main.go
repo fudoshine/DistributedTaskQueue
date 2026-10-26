@@ -317,7 +317,7 @@ func runProducer(ctx context.Context, queueName string, interval time.Duration, 
 			err := retryWithBackoff(ctx, 3, func() error {
 				return dbBreaker.Call(func() error {
 					workflow, e := jobs.CreateWorkflow(ctx, fmt.Sprintf("video-pipeline-%d", n))
-					workflowID=workflow.ID
+					workflowID = workflow.ID
 					return e
 				})
 			})
@@ -332,7 +332,7 @@ func runProducer(ctx context.Context, queueName string, interval time.Duration, 
 				{ID: notify, WorkflowID: workflowID, ParentIDs: []uuid.UUID{transcode}, TaskType: "VIDEO_NOTIFY", Payload: json.RawMessage(`{"channel":"email"}`)},
 			}
 			for _, task := range tasks {
-				if err := jobs.CreateJob(ctx, queueName, task); err != nil {
+				if _, err := jobs.CreateJob(ctx, queueName, task); err != nil {
 					slog.Error("create task", "taskId", task.ID, "error", err)
 					break
 				}
