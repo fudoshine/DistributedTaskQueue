@@ -7,7 +7,6 @@ import (
 	"distributed-queue/pkg/redis"
 	"distributed-queue/pkg/redis/metrics"
 	"distributed-queue/pkg/repository"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -286,61 +285,6 @@ func runJanitor(ctx context.Context, queueName string, interval, leaseTTL time.D
 	}
 }
 
-func retryWithBackoff(ctx context.Context, maxAttempts int, fn func() error) error {
-	var err error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		if err = fn(); err == nil {
-			return nil
-		}
-		if attempt == maxAttempts-1 {
-			break
-		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-time.After(time.Duration(1<<uint(attempt)) * time.Second):
-		}
-	}
-	return err
-}
-
-func runProducer(ctx context.Context, queueName string, interval time.Duration, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
-	defer wg.Done()
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for n := 1; ; n++ {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			var workflowID uuid.UUID
-			err := retryWithBackoff(ctx, 3, func() error {
-				return dbBreaker.Call(func() error {
-					workflow, e := jobs.CreateWorkflow(ctx, fmt.Sprintf("video-pipeline-%d", n))
-					workflowID = workflow.ID
-					return e
-				})
-			})
-			if err != nil {
-				slog.Error("create workflow", "error", err)
-				continue
-			}
-			upload, transcode, notify := uuid.New(), uuid.New(), uuid.New()
-			tasks := []repository.Task{
-				{ID: upload, WorkflowID: workflowID, TaskType: "VIDEO_UPLOAD", Payload: json.RawMessage(`{"file":"video.mp4"}`)},
-				{ID: transcode, WorkflowID: workflowID, ParentIDs: []uuid.UUID{upload}, TaskType: "VIDEO_TRANSCODE", Payload: json.RawMessage(`{"resolution":"1080p"}`)},
-				{ID: notify, WorkflowID: workflowID, ParentIDs: []uuid.UUID{transcode}, TaskType: "VIDEO_NOTIFY", Payload: json.RawMessage(`{"channel":"email"}`)},
-			}
-			for _, task := range tasks {
-				if _, err := jobs.CreateJob(ctx, queueName, task); err != nil {
-					slog.Error("create task", "taskId", task.ID, "error", err)
-					break
-				}
-			}
-		}
-	}
-}
-
 func runDepthCollector(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ticker := time.NewTicker(interval)
@@ -410,11 +354,10 @@ func main() {
 	breaker := circuitbreaker.New(5, 30*time.Second)
 	var wg sync.WaitGroup
 	workerCount := cfg.Worker.Count
-	wg.Add(workerCount + 5)
+	wg.Add(workerCount + 4)
 	for i := 0; i < workerCount; i++ {
 		go runWorker(ctx, cfg.Queue.Name, fmt.Sprintf("worker-%s-%d", uuid.NewString(), i), cfg.Queue.HoldTTL, store, jobs, breaker, &wg)
 	}
-	go runProducer(ctx, cfg.Queue.Name, cfg.Queue.TaskProducerInterval, jobs, breaker, &wg)
 	go runOutboxRelay(ctx, time.Second, cfg.Queue.HoldTTL, store, jobs, &wg)
 	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, cfg.Queue.HoldTTL, store, jobs, &wg)
 	go runDepthCollector(ctx, cfg.Queue.Name, cfg.Queue.DepthPollEvery, store, &wg)

@@ -38,11 +38,12 @@ The application derives these keys from `QUEUE_NAME`:
 WORKER_COUNT=5
 HOLD_TTL=20s
 JANITOR_INTERVAL=5s
-TASK_PRODUCER_INTERVAL=1s
 SHUTDOWN_TIMEOUT=30s
 ```
 
 `HOLD_TTL` is the PostgreSQL lease duration and Redis pending-entry idle threshold. Set it above the longest expected task duration; workers renew healthy leases every third of that duration.
+
+Workers consume submitted tasks. Starting a worker does not generate demo workflows or jobs.
 
 ## Observability
 

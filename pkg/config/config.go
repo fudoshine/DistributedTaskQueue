@@ -39,12 +39,11 @@ type MetricsConfig struct {
 }
 
 type QueueConfig struct {
-	Name                 string
-	HoldTTL              time.Duration
-	JanitorInterval      time.Duration
-	DelayedPollEvery     time.Duration
-	DepthPollEvery       time.Duration
-	TaskProducerInterval time.Duration
+	Name             string
+	HoldTTL          time.Duration
+	JanitorInterval  time.Duration
+	DelayedPollEvery time.Duration
+	DepthPollEvery   time.Duration
 }
 type TaskTypeConfig struct {
 	Name []string
@@ -100,12 +99,11 @@ func Load() (*Config, error) {
 			Addr: getEnv("METRICS_ADDR", ":9090"),
 		},
 		Queue: QueueConfig{
-			Name:                 getEnv("QUEUE_NAME", "queue:video_processing"),
-			HoldTTL:              parseDuration("HOLD_TTL", "20s"),
-			JanitorInterval:      parseDuration("JANITOR_INTERVAL", "5s"),
-			DelayedPollEvery:     parseDuration("DELAYED_POLL_INTERVAL", "2s"),
-			DepthPollEvery:       parseDuration("DEPTH_POLL_INTERVAL", "5s"),
-			TaskProducerInterval: parseDuration("TASK_PRODUCER_INTERVAL", "1s"),
+			Name:             getEnv("QUEUE_NAME", "queue:video_processing"),
+			HoldTTL:          parseDuration("HOLD_TTL", "20s"),
+			JanitorInterval:  parseDuration("JANITOR_INTERVAL", "5s"),
+			DelayedPollEvery: parseDuration("DELAYED_POLL_INTERVAL", "2s"),
+			DepthPollEvery:   parseDuration("DEPTH_POLL_INTERVAL", "5s"),
 		},
 		Worker: WorkerConfig{
 			Count:           parseInt("WORKER_COUNT", 5),

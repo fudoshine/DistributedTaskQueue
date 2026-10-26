@@ -18,10 +18,10 @@ GoQueue is a distributed task queue built from primitives in Go, using PostgreSQ
 ## Architecture
 
 ```
-Producer → outbox table (atomic tx) → Outbox Relay → Redis Queue → Workers → PostgreSQL
+REST API → outbox table (atomic tx) → Outbox Relay → Redis Queue → Workers → PostgreSQL
 ```
 
-- **Producer** writes `processed_jobs` + `outbox` row in one transaction. Never touches Redis directly.
+- **Task service** validates the catalog task type and payload before the repository writes `processed_jobs` + `outbox` in one transaction. Workers do not generate demo jobs.
 - **Outbox Relay** polls `outbox WHERE delivered=FALSE` every 2s, enqueues to Redis, marks delivered.
 - **Workers** consume from Redis, claim job in DB (CAS), process, enqueue children, mark complete.
 - **Janitor** sweeps tasks stuck in `:inflight` beyond `HOLD_TTL` back to main queue.
@@ -50,18 +50,16 @@ Migration files in `db/migrations/` — applied automatically on startup via `go
 
 ---
 
-## Current State (last updated: 2026-08-03)
+## Current State (last updated: 2026-10-26)
 
 ### From Kiro sessions (Jul 6 – Aug 3):
 
 - **Documentation**: Full docs in `docs/` — `architecture.md`, `quick-start.md`, `configuration.md`, `system-flows.md`, `troubleshooting.md`, `Tradeoff.md`, `METRICS_COMPLETE.md`, `ATOMIC_DAG_ORCHESTRATION.md`, `GRACEFUL_SHUTDOWN.md`, `SYSTEM_FLOW_DIAGRAMS.md`. Docs folder is NOT gitignored (was previously, fixed).
 - **Docker**: Full stack in `docker-compose.yml` at root — Postgres, Redis, app, Prometheus, Grafana. Old `pkg/deploy/` removed. Schema no longer mounted into `initdb.d` — migrations handle it.
 - **Migrations**: `golang-migrate` added. 6 migration files (000001–000006). `RunMigrations()` called in `main()` before pool opens. Migrations path: `file://db/migrations`.
-- **Producer rewrite**: Producer now creates real 3-step DAG pipelines per tick (`VIDEO_UPLOAD → VIDEO_TRANSCODE → VIDEO_NOTIFY`), each as its own workflow. Previously it created one flat workflow with all tasks dumped in.
-- **Outbox pattern**: `CreateJob` writes `processed_jobs` + `outbox` row atomically. `runOutboxRelay` handles Redis enqueue. Producer no longer calls `EnqueueTask` directly.
+- **Task submission**: The API service validates catalog task types and payloads. The automatic demo producer was removed in S1-01.
+- **Outbox pattern**: `CreateJob` writes `processed_jobs` + `outbox` row atomically. `runOutboxRelay` handles Redis enqueue.
 - **Orphan reconciler**: Removed — replaced by outbox relay which is the correct fix.
-- **Circuit breaker on producer**: `retryWithBackoff` helper added. Producer uses circuit breaker for `CreateWorkflow` and `CreateJob`.
-- **`retryWithBackoff` helper**: General-purpose retry with exponential backoff (1s→2s→4s...), respects context cancellation.
 - **README**: Rewritten — has ASCII diagram, real usage example with actual API, "why not X" section, correct Go version (1.25.6), docs table split into Guides/Reference.
 - **`.gitignore`**: `docs/METRICS_GUIDE.md` and `docs/SYSTEM_FLOW_DIAGRAMS.md` gitignored (not referenced in README). `docs/` folder itself is tracked.
 - **`pkg/repository/postgres.go`**: `NewPostgresPool` now accepts full `config.PostgresConfig` and wires pool settings (`MaxConns`, `MinConns`, `MaxConnLifetime`, `MaxConnIdle`, `MaxConnLifetimeJitter`). Registers `PgxPoolCollector` for Prometheus.
@@ -85,7 +83,7 @@ Migration files in `db/migrations/` — applied automatically on startup via `go
 - [ ] **Raise worker concurrency above 5** and verify `queue_inflight_depth` climbs and `queue_depth` growth slows. Re-check `pgxpool` acquire metrics — still have headroom at `MaxConns=10`.
 - [ ] **Confirm cascade-cancel atomicity** — verify child jobs can't be claimed between parent failure and cascade UPDATE completing (possible race window).
 - [ ] **Add pgxpool Grafana panels** — queries and alert rules already drafted in this file, not yet wired into dashboard JSON.
-- [ ] **Test producer DAG pipeline end-to-end** — verify `queue_workflows_completed_total` increments and `queue_children_enqueued_total` shows fan-out correctly with the new 3-step pipeline producer.
+- [ ] **Test API-submitted DAGs end-to-end** — verify workflow completion and child scheduling through the submission API.
 
 ---
 
@@ -108,7 +106,6 @@ Migration files in `db/migrations/` — applied automatically on startup via `go
 - **`CYCLE` clause in recursive CTEs** requires all three parts (`CYCLE col SET is_cycle_col USING path_col`). Also PG14+ only. Prefer manual path-array cycle detection.
 - **Docker Hub rate limits** — 100/6hr anonymous, 200/6hr authenticated. If `docker pull` times out with IPv6 error, wait 60-90s and retry before touching daemon config.
 - **`go.sum` missing entries** after adding `golang-migrate` — run `go mod tidy` to resolve.
-- **Producer backlog**: with 1 worker, 2s processing, 1 task/sec the queue grows unbounded. Default `WORKER_COUNT=5` and `TASK_PRODUCER_INTERVAL=5s` keeps it balanced for the 3-step pipeline (each pipeline = 3 tasks × 2s = 6s, 5 workers = 2.5 pipelines/6s, 1 pipeline produced every 5s).
 - **macOS linker warning** (`malformed LC_DYSYMTAB`) — harmless, from Go toolchain vs Xcode symbol table mismatch. Build still succeeds (exit 0). Suppress with `-ldflags="-w"` if needed.
 
 ---
@@ -164,3 +161,4 @@ Alert rules:
 - 2026-08-01 (Codex): Diagnosed pool sizing (confirmed non-issue), found worker concurrency likely bottleneck (inflight pinned at 5), confirmed 20% failure rate is reproducible/deterministic, fixed `CYCLE` syntax error in cascade-cancel query.
 - 2026-08-03 (Kiro): Updated CLAUDE.md to consolidate context across all Kiro + Codex sessions.
 - 2026-10-18: Fenced idle-delivery recovery with PostgreSQL `NOW()`, added cursor-based Redis PEL recovery, removed incomplete REST idempotency route enforcement, and added the protocol breaking-check gate.
+- 2026-10-26: Removed the automatic demo producer, its retry helper and configuration; adjusted worker shutdown accounting to four background goroutines. Reference-executor replacement and persisted catalog routing remain open in S1-01.
