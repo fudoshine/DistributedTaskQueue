@@ -15,6 +15,7 @@ package repository_test
 
 import (
 	"context"
+	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/config"
 	"distributed-queue/pkg/repository"
 	"encoding/json"
@@ -83,6 +84,19 @@ func RequireRepositoryIntegration(tb testing.TB) {
 	}
 }
 
+func referenceContract(tb testing.TB) execution.CatalogEntry {
+	tb.Helper()
+	catalog, err := execution.NewCatalog()
+	if err != nil {
+		tb.Fatal(err)
+	}
+	entry, err := catalog.Lookup("reference.echo")
+	if err != nil {
+		tb.Fatal(err)
+	}
+	return entry
+}
+
 // getDeliveryID reads back the outbox delivery_id written by CreateJob.
 // In production this flows: outbox → relay → Redis message → worker.
 // In tests we read it directly to simulate what the worker receives.
@@ -114,6 +128,7 @@ func BenchmarkCreateWorkflow(b *testing.B) {
 // Includes the full transactional outbox write — this is the honest API cost.
 func BenchmarkCreateJob(b *testing.B) {
 	RequireRepositoryIntegration(b)
+	contract := referenceContract(b)
 	ctx := context.Background()
 	workflow, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob")
 	if err != nil {
@@ -123,11 +138,13 @@ func BenchmarkCreateJob(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-			ID:         uuid.New(),
-			WorkflowID: workflowID,
-			TaskType:   "BENCH_TASK",
-			Payload:    json.RawMessage(`{"file":"video.mp4"}`),
-			MaxRetries: 3,
+			ExecutionContract: contract,
+			EffectKey:         uuid.New(),
+			ID:                uuid.New(),
+			WorkflowID:        workflowID,
+			TaskType:          contract.TaskType,
+			Payload:           json.RawMessage(`{"message":"benchmark"}`),
+			MaxRetries:        3,
 		}); err != nil {
 			b.Fatalf("create job: %v", err)
 		}
@@ -139,6 +156,7 @@ func BenchmarkCreateJob(b *testing.B) {
 // from Redis after the relay publishes the outbox row.
 func BenchmarkTryStartJob(b *testing.B) {
 	RequireRepositoryIntegration(b)
+	contract := referenceContract(b)
 	ctx := context.Background()
 	workflow, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob")
 	workflowID := workflow.ID
@@ -150,8 +168,10 @@ func BenchmarkTryStartJob(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		taskID := uuid.New()
 		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-			ID: taskID, WorkflowID: workflowID,
-			TaskType: "BENCH", Payload: json.RawMessage(`{}`),
+			ExecutionContract: contract,
+			EffectKey:         uuid.New(),
+			ID:                taskID, WorkflowID: workflowID,
+			TaskType: contract.TaskType, Payload: json.RawMessage(`{"message":"benchmark"}`),
 		}); err != nil {
 			b.Fatalf("create job: %v", err)
 		}
@@ -179,6 +199,7 @@ func BenchmarkTryStartJob(b *testing.B) {
 // with an 11-task chain (root + 10 children) per run.
 func BenchmarkCascadingCancellation(b *testing.B) {
 	RequireRepositoryIntegration(b)
+	contract := referenceContract(b)
 	ctx := context.Background()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
@@ -187,8 +208,10 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 		workflowID := workflow.ID
 		rootID := uuid.New()
 		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-			ID: rootID, WorkflowID: workflowID,
-			TaskType: "ROOT", Payload: json.RawMessage(`{}`),
+			ExecutionContract: contract,
+			EffectKey:         uuid.New(),
+			ID:                rootID, WorkflowID: workflowID,
+			TaskType: contract.TaskType, Payload: json.RawMessage(`{"message":"benchmark"}`),
 		}); err != nil {
 			b.Fatalf("create root: %v", err)
 		}
@@ -196,9 +219,11 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 		for j := 0; j < 10; j++ {
 			childID := uuid.New()
 			if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-				ID: childID, WorkflowID: workflowID,
+				ExecutionContract: contract,
+				EffectKey:         uuid.New(),
+				ID:                childID, WorkflowID: workflowID,
 				ParentIDs: []uuid.UUID{prevID},
-				TaskType:  "CHILD", Payload: json.RawMessage(`{}`),
+				TaskType:  contract.TaskType, Payload: json.RawMessage(`{"message":"benchmark"}`),
 			}); err != nil {
 				b.Fatalf("create child: %v", err)
 			}
@@ -217,6 +242,7 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 // Uses b.RunParallel with GOMAXPROCS goroutines sharing the connection pool.
 func BenchmarkCreateJobParallel(b *testing.B) {
 	RequireRepositoryIntegration(b)
+	contract := referenceContract(b)
 	ctx := context.Background()
 	workflow, err := sharedRepo.CreateWorkflow(ctx, "bench-createjob-parallel")
 	if err != nil {
@@ -227,11 +253,13 @@ func BenchmarkCreateJobParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-				ID:         uuid.New(),
-				WorkflowID: workflowID,
-				TaskType:   "BENCH_TASK",
-				Payload:    json.RawMessage(`{"file":"video.mp4"}`),
-				MaxRetries: 3,
+				ExecutionContract: contract,
+				EffectKey:         uuid.New(),
+				ID:                uuid.New(),
+				WorkflowID:        workflowID,
+				TaskType:          contract.TaskType,
+				Payload:           json.RawMessage(`{"message":"benchmark"}`),
+				MaxRetries:        3,
 			}); err != nil {
 				b.Errorf("create job: %v", err)
 				return
@@ -244,6 +272,7 @@ func BenchmarkCreateJobParallel(b *testing.B) {
 // Pre-creates all tasks before the benchmark timer starts.
 func BenchmarkTryStartJobParallel(b *testing.B) {
 	RequireRepositoryIntegration(b)
+	contract := referenceContract(b)
 	ctx := context.Background()
 	workflow, _ := sharedRepo.CreateWorkflow(ctx, "bench-trystartjob-parallel")
 	workflowID := workflow.ID
@@ -255,8 +284,10 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 	for i := 0; i < b.N; i++ {
 		taskID := uuid.New()
 		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-			ID: taskID, WorkflowID: workflowID,
-			TaskType: "BENCH", Payload: json.RawMessage(`{}`),
+			ExecutionContract: contract,
+			EffectKey:         uuid.New(),
+			ID:                taskID, WorkflowID: workflowID,
+			TaskType: contract.TaskType, Payload: json.RawMessage(`{"message":"benchmark"}`),
 		}); err != nil {
 			b.Fatalf("create job: %v", err)
 		}
@@ -296,6 +327,7 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 // Includes a warmup phase to avoid cold-start skew.
 func TestEndToEndLatency(t *testing.T) {
 	RequireRepositoryIntegration(t)
+	contract := referenceContract(t)
 	if os.Getenv("RUN_LATENCY_BENCHMARK") != "1" {
 		t.Skip("set RUN_LATENCY_BENCHMARK=1 to run the latency benchmark")
 	}
@@ -308,8 +340,10 @@ func TestEndToEndLatency(t *testing.T) {
 		workflow, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("warmup-%d", i))
 		wid := workflow.ID
 		_, _ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-			ID: uuid.New(), WorkflowID: wid,
-			TaskType: "WARMUP", Payload: json.RawMessage(`{}`),
+			ExecutionContract: contract,
+			EffectKey:         uuid.New(),
+			ID:                uuid.New(), WorkflowID: wid,
+			TaskType: contract.TaskType, Payload: json.RawMessage(`{"message":"benchmark"}`),
 		})
 	}
 
@@ -321,10 +355,12 @@ func TestEndToEndLatency(t *testing.T) {
 			t.Fatalf("create workflow: %v", err)
 		}
 		if _, err = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
-			ID:         uuid.New(),
-			WorkflowID: workflow.ID,
-			TaskType:   "LATENCY_TEST",
-			Payload:    json.RawMessage(`{}`),
+			ExecutionContract: contract,
+			EffectKey:         uuid.New(),
+			ID:                uuid.New(),
+			WorkflowID:        workflow.ID,
+			TaskType:          contract.TaskType,
+			Payload:           json.RawMessage(`{"message":"benchmark"}`),
 		}); err != nil {
 			t.Fatalf("create job: %v", err)
 		}
@@ -350,6 +386,7 @@ func TestEndToEndLatency(t *testing.T) {
 
 func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
 	RequireRepositoryIntegration(t)
+	contract := referenceContract(t)
 	ctx := context.Background()
 	workflow, err := sharedRepo.CreateWorkflow(ctx, "recover-idle-delivery")
 	if err != nil {
@@ -357,8 +394,11 @@ func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
 	}
 	workflowID := workflow.ID
 	taskID := uuid.New()
+	effectKey := uuid.New()
 	if _, err := sharedRepo.CreateJob(ctx, "queue:recover", repository.Task{
-		ID: taskID, WorkflowID: workflowID, TaskType: "RECOVER", Payload: json.RawMessage(`{}`),
+		ExecutionContract: contract,
+		EffectKey:         effectKey,
+		ID:                taskID, WorkflowID: workflowID, TaskType: contract.TaskType, Payload: json.RawMessage(`{"message":"benchmark"}`),
 	}); err != nil {
 		t.Fatalf("create job: %v", err)
 	}
@@ -395,5 +435,14 @@ func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
 	}
 	if recoveryDeliveries != 1 {
 		t.Fatalf("recovery deliveries = %d, want 1", recoveryDeliveries)
+	}
+
+	stored, err := sharedRepo.GetTask(ctx, taskID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.EffectKey == nil || *stored.EffectKey != effectKey ||
+		stored.ExecutionContract == nil || *stored.ExecutionContract != contract {
+		t.Fatalf("recovery changed accepted metadata: %+v", stored)
 	}
 }

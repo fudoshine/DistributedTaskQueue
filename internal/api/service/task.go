@@ -36,13 +36,16 @@ func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflow
 	}
 
 	taskID := uuid.New()
+	effectKey := uuid.New()
 	task := repository.Task{
-		ID:         taskID,
-		WorkflowID: workflowID,
-		ParentIDs:  parentIDs,
-		TaskType:   taskType,
-		Payload:    payload,
-		MaxRetries: maxRetries,
+		ID:                taskID,
+		WorkflowID:        workflowID,
+		ParentIDs:         parentIDs,
+		TaskType:          taskType,
+		Payload:           payload,
+		ExecutionContract: entry,
+		EffectKey:         effectKey,
+		MaxRetries:        maxRetries,
 	}
 	stored, err := s.repo.CreateJob(ctx, queueName, task)
 	if err != nil {

@@ -39,12 +39,14 @@ var (
 // structure: every task belongs to exactly one workflow, and may optionally
 // have parent tasks it depends on (must complete before this runs).
 type Task struct {
-	ID         uuid.UUID
-	WorkflowID uuid.UUID
-	ParentIDs  []uuid.UUID // empty slice for root tasks in a workflow
-	TaskType   string
-	Payload    json.RawMessage
-	MaxRetries int // 0 means "use the schema default (3)"
+	ID                uuid.UUID
+	WorkflowID        uuid.UUID
+	ParentIDs         []uuid.UUID // empty slice for root tasks in a workflow
+	TaskType          string
+	ExecutionContract execution.CatalogEntry
+	EffectKey         uuid.UUID
+	Payload           json.RawMessage
+	MaxRetries        int // 0 means "use the schema default (3)"
 }
 type Workflow struct {
 	ID             uuid.UUID
@@ -140,6 +142,20 @@ func (r *JobRepository) CreateWorkflow(ctx context.Context, name string) (Workfl
 // because the same ID is used as the Redis queue member — Redis and
 // Postgres need to agree on task identity before either one sees the task.
 func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Task) (JobRow, error) {
+	if err := task.ExecutionContract.Validate(); err != nil {
+		return JobRow{}, fmt.Errorf("invalid execution contract: %w", err)
+	}
+	if task.ExecutionContract.TaskType != task.TaskType {
+		return JobRow{}, errors.New("execution contract task type does not match task")
+	}
+	if task.EffectKey == uuid.Nil {
+		return JobRow{}, errors.New("effect key is required")
+	}
+	contractJSON, err := json.Marshal(task.ExecutionContract)
+	if err != nil {
+		return JobRow{}, fmt.Errorf("failed to encode execution contract: %w", err)
+	}
+
 	payload := task.Payload
 	if payload == nil {
 		payload = json.RawMessage(`{}`)
@@ -159,13 +175,15 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 	var jobRow JobRow
 	// Insert the job
 	query := `
-		INSERT INTO processed_jobs (id, workflow_id, task_type, status, task_details, max_retries)
-		VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($6, 0), 3))
+		INSERT INTO processed_jobs (id, workflow_id, task_type, status, task_details, max_retries,
+		                            execution_contract, effect_key)
+		VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($6, 0), 3), $7, $8)
 		RETURNING id, workflow_id, task_type, tenant_id, execution_contract, effect_key,
 		          status, current_retries, max_retries, error_log, created_at, processed_at, available_at;
 	`
 	err = tx.QueryRow(ctx, query,
 		task.ID, task.WorkflowID, task.TaskType, status, payload, task.MaxRetries,
+		contractJSON, task.EffectKey,
 	).Scan(
 		&jobRow.ID, &jobRow.WorkflowID, &jobRow.TaskType,
 		&jobRow.TenantID, &jobRow.ExecutionContract, &jobRow.EffectKey,

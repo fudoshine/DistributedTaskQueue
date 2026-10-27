@@ -14,12 +14,15 @@ import (
 
 func TestCreateJobReturnsEmptyRowOnRollback(t *testing.T) {
 	RequireRepositoryIntegration(t)
+	contract := referenceContract(t)
 	workflow, err := sharedRepo.CreateWorkflow(t.Context(), "create rollback")
 	if err != nil {
 		t.Fatal(err)
 	}
 	parent, err := sharedRepo.CreateJob(t.Context(), "queue:test", repository.Task{
-		ID: uuid.New(), WorkflowID: workflow.ID, TaskType: "reference.echo",
+		ExecutionContract: contract,
+		EffectKey:         uuid.New(),
+		ID:                uuid.New(), WorkflowID: workflow.ID, TaskType: "reference.echo",
 		Payload: json.RawMessage(`{"message":"parent"}`),
 	})
 	if err != nil {
@@ -36,7 +39,9 @@ func TestCreateJobReturnsEmptyRowOnRollback(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
 			result, err := sharedRepo.CreateJob(t.Context(), tc.queue, repository.Task{
-				ID: uuid.New(), WorkflowID: workflow.ID, ParentIDs: tc.parents,
+				ExecutionContract: contract,
+				EffectKey:         uuid.New(),
+				ID:                uuid.New(), WorkflowID: workflow.ID, ParentIDs: tc.parents,
 				TaskType: "reference.echo", Payload: json.RawMessage(`{"message":"hello"}`),
 			})
 			if err == nil {
