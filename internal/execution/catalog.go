@@ -3,6 +3,7 @@ package execution
 import (
 	"errors"
 	"math/bits"
+	"slices"
 	"strings"
 	"time"
 )
@@ -125,6 +126,7 @@ type Catalog struct {
 	taskTypes    map[capability]taskDefinition
 	payloadTypes map[schemaKey]payloadDefinition
 	resultTypes  map[schemaKey]resultDefinition
+	routes       []CatalogEntry
 }
 
 func NewCatalog() (*Catalog, error) {
@@ -167,6 +169,10 @@ func NewCatalog() (*Catalog, error) {
 		[]payloadDefinition{payload},
 		[]resultDefinition{result},
 	)
+}
+
+func (c *Catalog) Routes() []CatalogEntry {
+	return slices.Clone(c.routes)
 }
 
 func (c *Catalog) Lookup(taskType string) (CatalogEntry, error) {

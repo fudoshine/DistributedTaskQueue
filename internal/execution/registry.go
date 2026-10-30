@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 )
 
 type capability struct {
@@ -104,6 +105,7 @@ func newCatalog(entries []CatalogEntry, payloads []payloadDefinition, results []
 		catalog.taskTypes[key] = definition
 		catalog.entries[entry.TaskType] = entry
 	}
+	catalog.routes = slices.Clone(entries)
 	return catalog, nil
 }
 
