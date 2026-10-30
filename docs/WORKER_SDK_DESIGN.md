@@ -30,6 +30,7 @@ services may own their own databases, inboxes, and outboxes.
 
 | Decision | V1 contract |
 | --- | --- |
+| Tenancy and worker trust | Shared platform for independent tenants; all workers are trusted deployments operated by the platform team. Tenant-operated workers and customer worker enrollment are outside v1. |
 | Routing | Caller submits task type and payload. Server selects and persists tenant, handler version, capability stream, execution pool, schema and policy revision. |
 | Graph activation | Build a DRAFT workflow, then seal it atomically. No handler runs before seal; the graph is immutable afterward. |
 | Isolation | Email and media use separate pools, deployments and resource budgets. A queue name is not a runtime predictor or a security boundary. |
@@ -291,6 +292,11 @@ identity to an operator-managed principal/service/capability policy. Metadata
 such as service name, instance ID or build string is descriptive, never
 authority. Revocation/capability policy is checked on every RPC and at mutation
 commit; no process-local positive authorization cache is a security boundary.
+
+Only operator-provisioned platform-worker identities may register. Authorized
+workers may serve multiple tenants within their service/capability policy;
+Task.TenantID remains server-derived, and business-object lookups and effect
+keys remain tenant-scoped. This trust model excludes tenant-operated workers.
 
 RegisterWorker returns the intersection of advertised and allowed
 capabilities. That subset and slot cap are immutable for the session. Renewal
@@ -1039,6 +1045,12 @@ release requires C01–C22, except actual media subprocess evidence in S5 and
 the complete Saga engine in S6; their SDK behaviors still need synthetic
 fixtures at S4. Disabled object/result/capability modes cannot be advertised
 as supported before their corresponding tests pass.
+
+Basic queue/SDK production use additionally requires S7 operational/capacity
+sign-off and S5-03 real-artifact-adapter evidence for object-result routes.
+S5-03 can run with object-producing SDK fixtures before the media worker.
+Media and Saga require their own feature and operational gates; their delivery
+does not delay basic queue/SDK sign-off.
 
 Release checklist: reproducible code generation; proto breaking checks;
 Go unit/race/vet and real integration/conformance CI; clean external-module

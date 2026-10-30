@@ -55,7 +55,7 @@ func TestTaskServiceCreateTask(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
-			result, err := svc.CreateTask(t.Context(), "queue:service-test", workflow.ID, nil, tc.taskType, tc.payload, 3)
+			result, err := svc.CreateTask(t.Context(), "queue:service-test", workflow.ID, nil, tc.taskType, tc.payload)
 			var added int64
 			if tc.invalid {
 				if !errors.Is(err, service.ErrInvalidTaskInput) {
@@ -96,13 +96,18 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	contract, err := catalog.Lookup("reference.echo")
+	if err != nil {
+		t.Fatal(err)
+	}
 	svc := service.NewTaskService(sharedRepo, catalog)
 	workflow, err := sharedRepo.CreateWorkflow(t.Context(), "task HTTP validation")
 	if err != nil {
 		t.Fatal(err)
 	}
 	router := gin.New()
-	handler := v1.NewTaskHandler(svc, "queue:service-test")
+	const queueName = "queue:service-test"
+	handler := v1.NewTaskHandler(svc, queueName)
 	router.POST("/api/v1/workflows/:id/tasks", handler.CreateTask)
 	for _, tc := range []struct {
 		name       string
@@ -112,8 +117,35 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 	}{
 		{"unknown type", `{"task_type":"email.send","payload":{"message":"hello"}}`, http.StatusBadRequest, false},
 		{"invalid payload", `{"task_type":"reference.echo","payload":{"message":42}}`, http.StatusBadRequest, false},
+		{"queue override", `{"task_type":"reference.echo","payload":{"message":"hello"},"queue_name":"other"}`, http.StatusBadRequest, false},
+		{"empty queue override", `{"task_type":"reference.echo","payload":{"message":"hello"},"queue_name":""}`, http.StatusBadRequest, false},
+		{"null queue override", `{"task_type":"reference.echo","payload":{"message":"hello"},"queue_name":null}`, http.StatusBadRequest, false},
+		{"retry override", `{"task_type":"reference.echo","payload":{"message":"hello"},"max_retries":7}`, http.StatusBadRequest, false},
+		{"zero retry override", `{"task_type":"reference.echo","payload":{"message":"hello"},"max_retries":0}`, http.StatusBadRequest, false},
+		{"null retry override", `{"task_type":"reference.echo","payload":{"message":"hello"},"max_retries":null}`, http.StatusBadRequest, false},
+		{"tenant override", `{"task_type":"reference.echo","payload":{"message":"hello"},"tenant_id":"00000000-0000-0000-0000-000000000001"}`, http.StatusBadRequest, false},
+		{"empty tenant override", `{"task_type":"reference.echo","payload":{"message":"hello"},"tenant_id":""}`, http.StatusBadRequest, false},
+		{"null tenant override", `{"task_type":"reference.echo","payload":{"message":"hello"},"tenant_id":null}`, http.StatusBadRequest, false},
+		{"TTL override", `{"task_type":"reference.echo","payload":{"message":"hello"},"ttl_seconds":3600}`, http.StatusBadRequest, false},
+		{"zero TTL override", `{"task_type":"reference.echo","payload":{"message":"hello"},"ttl_seconds":0}`, http.StatusBadRequest, false},
+		{"null TTL override", `{"task_type":"reference.echo","payload":{"message":"hello"},"ttl_seconds":null}`, http.StatusBadRequest, false},
+		{"handler override", `{"task_type":"reference.echo","payload":{"message":"hello"},"handler_version":"v2"}`, http.StatusBadRequest, false},
+		{"contract override", `{"task_type":"reference.echo","payload":{"message":"hello"},"execution_contract":{}}`, http.StatusBadRequest, false},
+		{"effect key override", `{"task_type":"reference.echo","payload":{"message":"hello"},"effect_key":null}`, http.StatusBadRequest, false},
+		{"unknown field", `{"task_type":"reference.echo","payload":{"message":"hello"},"unknown":true}`, http.StatusBadRequest, false},
+		{"trailing JSON", `{"task_type":"reference.echo","payload":{"message":"hello"}} {}`, http.StatusBadRequest, false},
+		{"trailing malformed data", `{"task_type":"reference.echo","payload":{"message":"hello"}} invalid`, http.StatusBadRequest, false},
+		{"missing task type", `{"payload":{"message":"hello"}}`, http.StatusBadRequest, false},
+		{"empty task type", `{"task_type":"","payload":{"message":"hello"}}`, http.StatusBadRequest, false},
+		{"missing payload", `{"task_type":"reference.echo"}`, http.StatusBadRequest, false},
+		{"null payload", `{"task_type":"reference.echo","payload":null}`, http.StatusBadRequest, false},
+		{"empty object", `{}`, http.StatusBadRequest, false},
+		{"null body", `null`, http.StatusBadRequest, false},
+		{"empty body", ``, http.StatusBadRequest, false},
+		{"malformed JSON", `{"task_type":`, http.StatusBadRequest, false},
 		{"database failure", `{"task_type":"reference.echo","payload":{"message":"hello"}}`, http.StatusInternalServerError, true},
 		{"valid echo", `{"task_type":"reference.echo","payload":{"message":"hello"}}`, http.StatusCreated, false},
+		{"valid echo with whitespace", "{\"task_type\":\"reference.echo\",\"parent_ids\":[],\"payload\":{\"message\":\"hello\"}} \n\t", http.StatusCreated, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			testRouter := router
@@ -125,9 +157,9 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 				pool.Close()
 				failedService := service.NewTaskService(repository.NewJobRepository(pool), catalog)
 				testRouter = gin.New()
-				testRouter.POST("/api/v1/workflows/:id/tasks", v1.NewTaskHandler(failedService, "queue:service-test").CreateTask)
+				testRouter.POST("/api/v1/workflows/:id/tasks", v1.NewTaskHandler(failedService, queueName).CreateTask)
 			}
-			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
+			beforeWorkflows, beforeJobs, beforeOutbox := submissionRowCounts(t)
 			request := httptest.NewRequest(http.MethodPost, "/api/v1/workflows/"+workflow.ID.String()+"/tasks", strings.NewReader(tc.body))
 			request.Header.Set("Content-Type", "application/json")
 			response := httptest.NewRecorder()
@@ -149,8 +181,16 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 					t.Fatalf("unexpected stored task: %+v", stored)
 				}
 				assertTaskResponseMatchesStored(t, result, stored)
-				if result.MaxRetries != 3 {
-					t.Fatalf("expected persisted retry default 3, got %d", result.MaxRetries)
+				if result.MaxRetries != contract.MaxAttempts {
+					t.Fatalf("retry budget = %d, want catalog budget %d", result.MaxRetries, contract.MaxAttempts)
+				}
+				var storedQueue string
+				if err := sharedPool.QueryRow(t.Context(),
+					`SELECT queue_name FROM outbox WHERE task_id = $1 AND generation = 0`, result.ID).Scan(&storedQueue); err != nil {
+					t.Fatal(err)
+				}
+				if storedQueue != queueName {
+					t.Fatalf("outbox queue = %q, want configured queue %q", storedQueue, queueName)
 				}
 				added = 1
 			} else {
@@ -159,10 +199,10 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 					t.Fatalf("expected JSON error response, got %s", response.Body.String())
 				}
 			}
-			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
-			if afterJobs != beforeJobs+added || afterOutbox != beforeOutbox+added {
-				t.Fatalf("job/outbox counts changed from %d/%d to %d/%d; expected delta %d/%d",
-					beforeJobs, beforeOutbox, afterJobs, afterOutbox, added, added)
+			afterWorkflows, afterJobs, afterOutbox := submissionRowCounts(t)
+			if afterWorkflows != beforeWorkflows || afterJobs != beforeJobs+added || afterOutbox != beforeOutbox+added {
+				t.Fatalf("workflow/job/outbox counts changed from %d/%d/%d to %d/%d/%d; expected delta 0/%d/%d",
+					beforeWorkflows, beforeJobs, beforeOutbox, afterWorkflows, afterJobs, afterOutbox, added, added)
 			}
 		})
 	}
@@ -171,6 +211,10 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 func TestTaskCreationReturnsPersistedState(t *testing.T) {
 	RequireRepositoryIntegration(t)
 	catalog, err := execution.NewCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract, err := catalog.Lookup("reference.echo")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -183,12 +227,10 @@ func TestTaskCreationReturnsPersistedState(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		dependent  bool
-		maxRetries int
-		wantMax    int
 		wantStatus domain.TaskStatus
 	}{
-		{"root with default retries", false, 0, 3, domain.TaskStatusQueued},
-		{"child with explicit retries", true, 7, 7, domain.TaskStatusPending},
+		{"root uses catalog budget", false, domain.TaskStatusQueued},
+		{"child uses catalog budget", true, domain.TaskStatusPending},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var parents []uuid.UUID
@@ -197,7 +239,7 @@ func TestTaskCreationReturnsPersistedState(t *testing.T) {
 			}
 			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
 			result, err := svc.CreateTask(t.Context(), "queue:service-test", workflow.ID, parents,
-				"reference.echo", json.RawMessage(`{"message":"hello"}`), tc.maxRetries)
+				"reference.echo", json.RawMessage(`{"message":"hello"}`))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -206,8 +248,8 @@ func TestTaskCreationReturnsPersistedState(t *testing.T) {
 				t.Fatal(err)
 			}
 			assertTaskResponseMatchesStored(t, result, stored)
-			if result.MaxRetries != tc.wantMax || result.Status != tc.wantStatus || !slices.Equal(result.ParentIDs, parents) {
-				t.Fatalf("unexpected defaults, status or parents: %+v", result)
+			if result.MaxRetries != contract.MaxAttempts || result.Status != tc.wantStatus || !slices.Equal(result.ParentIDs, parents) {
+				t.Fatalf("unexpected catalog budget, status or parents: %+v", result)
 			}
 			if !tc.dependent {
 				parentID = result.ID
@@ -239,11 +281,17 @@ func assertTaskResponseMatchesStored(t *testing.T, result api.TaskResponse, stor
 }
 
 func taskSubmissionRowCounts(t *testing.T) (jobs, outbox int64) {
+	_, jobs, outbox = submissionRowCounts(t)
+	return jobs, outbox
+}
+
+func submissionRowCounts(t *testing.T) (workflows, jobs, outbox int64) {
 	t.Helper()
 	if err := sharedPool.QueryRow(t.Context(), `SELECT
+		(SELECT COUNT(*) FROM workflows),
 		(SELECT COUNT(*) FROM processed_jobs),
-		(SELECT COUNT(*) FROM outbox)`).Scan(&jobs, &outbox); err != nil {
+		(SELECT COUNT(*) FROM outbox)`).Scan(&workflows, &jobs, &outbox); err != nil {
 		t.Fatal(err)
 	}
-	return jobs, outbox
+	return workflows, jobs, outbox
 }

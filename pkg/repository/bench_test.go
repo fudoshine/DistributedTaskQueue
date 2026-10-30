@@ -144,7 +144,6 @@ func BenchmarkCreateJob(b *testing.B) {
 			WorkflowID:        workflowID,
 			TaskType:          contract.TaskType,
 			Payload:           json.RawMessage(`{"message":"benchmark"}`),
-			MaxRetries:        3,
 		}); err != nil {
 			b.Fatalf("create job: %v", err)
 		}
@@ -259,7 +258,6 @@ func BenchmarkCreateJobParallel(b *testing.B) {
 				WorkflowID:        workflowID,
 				TaskType:          contract.TaskType,
 				Payload:           json.RawMessage(`{"message":"benchmark"}`),
-				MaxRetries:        3,
 			}); err != nil {
 				b.Errorf("create job: %v", err)
 				return

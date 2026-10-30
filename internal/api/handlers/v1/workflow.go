@@ -22,7 +22,7 @@ func NewWorkflowHandler(workflowSvc *service.WorkflowService) *WorkflowHandler {
 
 func (h *WorkflowHandler) CreateWorkflow(c *gin.Context) {
 	var req api.CreateWorkflowRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}

@@ -30,15 +30,12 @@ func (h *TaskHandler) CreateTask(c *gin.Context) {
 		return
 	}
 	var req api.CreateTaskRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
+	if err := bindStrictJSON(c, &req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	queueName := req.QueueName
-	if queueName == "" {
-		queueName = h.defaultQueueNames
-	}
-	task, err := h.taskSvc.CreateTask(c.Request.Context(), queueName, workflowID, req.ParentIDs, req.TaskType, req.Payload, req.MaxRetries)
+	queueName := h.defaultQueueNames
+	task, err := h.taskSvc.CreateTask(c.Request.Context(), queueName, workflowID, req.ParentIDs, req.TaskType, req.Payload)
 	if err != nil {
 		status := http.StatusInternalServerError
 		if errors.Is(err, service.ErrInvalidTaskInput) {

@@ -2,6 +2,7 @@ package repository_test
 
 import (
 	"distributed-queue/internal/api/service"
+	"distributed-queue/internal/domain"
 	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/repository"
 	"encoding/json"
@@ -55,6 +56,7 @@ func TestCreateJobPinsExecutionContract(t *testing.T) {
 	revised.RouteRevision++
 	revised.CapabilityStream = fmt.Sprintf("queue:%s:%s:r%d:stream", revised.TaskType, revised.HandlerVersion, revised.RouteRevision)
 	revised.LeaseTTL += time.Second
+	revised.MaxAttempts = 5
 	workflow, err := sharedRepo.CreateWorkflow(t.Context(), "pinned contracts")
 	if err != nil {
 		t.Fatal(err)
@@ -76,7 +78,7 @@ func TestCreateJobPinsExecutionContract(t *testing.T) {
 		}
 		for _, row := range []repository.JobRow{result, stored} {
 			if row.ExecutionContract == nil || *row.ExecutionContract != contract ||
-				row.EffectKey == nil || *row.EffectKey != effectKey {
+				row.EffectKey == nil || *row.EffectKey != effectKey || row.MaxRetries != contract.MaxAttempts {
 				t.Fatalf("accepted metadata did not round trip: %+v", row)
 			}
 		}
@@ -89,8 +91,63 @@ func TestCreateJobPinsExecutionContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	if first.ExecutionContract == nil || *first.ExecutionContract != original ||
-		first.EffectKey == nil || *first.EffectKey != firstEffectKey {
+		first.EffectKey == nil || *first.EffectKey != firstEffectKey || first.MaxRetries != original.MaxAttempts {
 		t.Fatalf("creating a new revision changed the earlier job: %+v", first)
+	}
+}
+
+func TestSingleAttemptContractFailsWithoutRetry(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	contract := referenceContract(t)
+	contract.RouteRevision += 2
+	contract.CapabilityStream = fmt.Sprintf("queue:%s:%s:r%d:stream", contract.TaskType, contract.HandlerVersion, contract.RouteRevision)
+	contract.MaxAttempts = 1
+	workflow, err := sharedRepo.CreateWorkflow(t.Context(), "single attempt budget")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const queueName = "queue:single-attempt"
+	job, err := sharedRepo.CreateJob(t.Context(), queueName, repository.Task{
+		ID: uuid.New(), WorkflowID: workflow.ID, TaskType: contract.TaskType,
+		ExecutionContract: contract, EffectKey: uuid.New(),
+		Payload: json.RawMessage(`{"message":"hello"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	deliveryID, err := getDeliveryID(t.Context(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := sharedRepo.TryStartJob(t.Context(), queueName, job.ID.String(), deliveryID.String(), 0, contract.LeaseTTL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.LeaseToken == uuid.Nil || claim.Attempt != 1 {
+		t.Fatalf("expected first leased attempt, got %+v", claim)
+	}
+	currentRetries, maxRetries, err := sharedRepo.RecordFailure(t.Context(), queueName, job.ID.String(), claim.LeaseToken, "handler failed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentRetries != 1 || maxRetries != 1 {
+		t.Fatalf("failure returned counters %d/%d, want 1/1", currentRetries, maxRetries)
+	}
+	stored, err := sharedRepo.GetTask(t.Context(), job.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.Status != domain.TaskStatusFailed || stored.CurrentRetries != 1 || stored.MaxRetries != 1 {
+		t.Fatalf("single attempt budget did not fail terminally: %+v", stored)
+	}
+	var deliveryCount int64
+	var maxGeneration int
+	if err := sharedPool.QueryRow(t.Context(), `SELECT COUNT(*), COALESCE(MAX(generation), -1)
+		FROM outbox WHERE task_id = $1`, job.ID).Scan(&deliveryCount, &maxGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if deliveryCount != 1 || maxGeneration != 0 {
+		t.Fatalf("terminal failure created a retry delivery: count=%d max generation=%d", deliveryCount, maxGeneration)
 	}
 }
 
@@ -112,7 +169,7 @@ func TestTaskServicePinsContractAndCreatesDistinctEffectKeys(t *testing.T) {
 	var previousEffectKey uuid.UUID
 	for range 2 {
 		result, err := svc.CreateTask(t.Context(), "queue:test", workflow.ID, nil,
-			contract.TaskType, json.RawMessage(`{"message":"hello"}`), 3)
+			contract.TaskType, json.RawMessage(`{"message":"hello"}`))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -121,7 +178,8 @@ func TestTaskServicePinsContractAndCreatesDistinctEffectKeys(t *testing.T) {
 			t.Fatal(err)
 		}
 		if stored.ExecutionContract == nil || *stored.ExecutionContract != contract ||
-			stored.EffectKey == nil || *stored.EffectKey == uuid.Nil || *stored.EffectKey == previousEffectKey {
+			stored.EffectKey == nil || *stored.EffectKey == uuid.Nil || *stored.EffectKey == previousEffectKey ||
+			stored.MaxRetries != contract.MaxAttempts {
 			t.Fatalf("missing contract or distinct nonzero effect key: %+v", stored)
 		}
 		previousEffectKey = *stored.EffectKey

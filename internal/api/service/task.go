@@ -26,7 +26,7 @@ func NewTaskService(repo *repository.JobRepository, catalog *execution.Catalog) 
 	}
 }
 
-func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflowID uuid.UUID, parentIDs []uuid.UUID, taskType string, payload json.RawMessage, maxRetries int) (api.TaskResponse, error) {
+func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflowID uuid.UUID, parentIDs []uuid.UUID, taskType string, payload json.RawMessage) (api.TaskResponse, error) {
 	entry, err := s.catalog.Lookup(taskType)
 	if err != nil {
 		return api.TaskResponse{}, fmt.Errorf("%w: %w", ErrInvalidTaskInput, err)
@@ -45,7 +45,6 @@ func (s *TaskService) CreateTask(ctx context.Context, queueName string, workflow
 		Payload:           payload,
 		ExecutionContract: entry,
 		EffectKey:         effectKey,
-		MaxRetries:        maxRetries,
 	}
 	stored, err := s.repo.CreateJob(ctx, queueName, task)
 	if err != nil {

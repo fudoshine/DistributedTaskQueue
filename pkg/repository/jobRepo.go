@@ -46,7 +46,6 @@ type Task struct {
 	ExecutionContract execution.CatalogEntry
 	EffectKey         uuid.UUID
 	Payload           json.RawMessage
-	MaxRetries        int // 0 means "use the schema default (3)"
 }
 type Workflow struct {
 	ID             uuid.UUID
@@ -177,12 +176,12 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 	query := `
 		INSERT INTO processed_jobs (id, workflow_id, task_type, status, task_details, max_retries,
 		                            execution_contract, effect_key)
-		VALUES ($1, $2, $3, $4, $5, COALESCE(NULLIF($6, 0), 3), $7, $8)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, workflow_id, task_type, tenant_id, execution_contract, effect_key,
 		          status, current_retries, max_retries, error_log, created_at, processed_at, available_at;
 	`
 	err = tx.QueryRow(ctx, query,
-		task.ID, task.WorkflowID, task.TaskType, status, payload, task.MaxRetries,
+		task.ID, task.WorkflowID, task.TaskType, status, payload, task.ExecutionContract.MaxAttempts,
 		contractJSON, task.EffectKey,
 	).Scan(
 		&jobRow.ID, &jobRow.WorkflowID, &jobRow.TaskType,

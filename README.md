@@ -180,7 +180,7 @@ Create a workflow:
 ```bash
 curl -X POST http://localhost:8080/api/v1/workflows \
   -H "Content-Type: application/json" \
-  -d '{"name": "video-pipeline"}'
+  -d '{"name": "echo-demo"}'
 ```
 
 Add a task:
@@ -188,8 +188,8 @@ Add a task:
 curl -X POST http://localhost:8080/api/v1/workflows/<workflow-id>/tasks \
   -H "Content-Type: application/json" \
   -d '{
-    "task_type": "VIDEO_UPLOAD",
-    "payload": {"file": "video.mp4"}
+    "task_type": "reference.echo",
+    "payload": {"message": "hello"}
   }'
 ```
 
@@ -227,7 +227,9 @@ Protobuf checks remain available through `make proto-check`.
 | `POST` | `/api/v1/workflows/:id/tasks` | Add a task to a workflow |
 | `GET` | `/api/v1/tasks/:id` | Get task status |
 
-Tasks accept an optional `queue_name` field. If omitted, the default queue from config is used. This allows routing different task types to different worker pools without any API changes.
+Task requests accept only `parent_ids`, `task_type`, and `payload`. Omit `parent_ids` for a root task, or pass an array of parent task UUIDs. The current catalog supports `reference.echo` with a payload such as `{"message":"hello"}`.
+
+The server chooses queue routing and retry settings. Unknown request fields, including `queue_name`, `max_retries`, TTL, and tenant overrides, return `400 Bad Request`. Send exactly one JSON object per request.
 
 ---
 

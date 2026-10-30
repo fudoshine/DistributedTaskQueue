@@ -50,7 +50,7 @@ Migration files in `db/migrations/` — applied automatically on startup via `go
 
 ---
 
-## Current State (last updated: 2026-10-26)
+## Current State (last updated: 2026-10-28)
 
 ### From Kiro sessions (Jul 6 – Aug 3):
 
@@ -93,7 +93,7 @@ Migration files in `db/migrations/` — applied automatically on startup via `go
 - **WAL ordering**: DB write always before Redis enqueue. Outbox relay is the only path to Redis for new tasks. Workers enqueue children directly (not via outbox) since child enqueue is part of the completion transaction.
 - **AND semantics for DAG**: Any parent failure cancels ALL descendants. Not OR semantics.
 - **Junction table for DAG**: `job_dependencies(child_job_id, parent_job_id)` — supports multi-parent tasks.
-- **Row-Level Security (RLS)**: Not using. Single-tenant, one binary owns all writes.
+- **Row-Level Security (RLS)**: Not enabled. Planned v1 serves multiple tenants through tenant-scoped repository access with trusted, platform-operated workers; tenant-operated workers are outside v1. See `docs/WORKER_SDK_DESIGN.md`.
 - **Circuit breaker config**: 5 failures → OPEN, 30s → HALF_OPEN probe.
 - **Graceful shutdown**: 30s timeout (`SHUTDOWN_TIMEOUT`), waits for in-flight tasks.
 - **`CYCLE` clause**: Don't use PG14 `CYCLE col SET is_cycle USING path` syntax. Use manual path-array + `WHERE NOT x = ANY(path)` — portable since PG 8.4.
@@ -162,3 +162,4 @@ Alert rules:
 - 2026-08-03 (Kiro): Updated CLAUDE.md to consolidate context across all Kiro + Codex sessions.
 - 2026-10-18: Fenced idle-delivery recovery with PostgreSQL `NOW()`, added cursor-based Redis PEL recovery, removed incomplete REST idempotency route enforcement, and added the protocol breaking-check gate.
 - 2026-10-26: Removed the automatic demo producer, its retry helper and configuration; adjusted worker shutdown accounting to four background goroutines. Reference-executor replacement and persisted catalog routing remain open in S1-01.
+- 2026-10-28: Clarified multi-tenant/platform-operated worker scope in the sprint/SDK contracts and separated basic production sign-off from media/Saga, retaining real-storage gates. S1-01 scope, object-result support and seal-health policy are unchanged; accepting seals while workers are offline remains undecided.

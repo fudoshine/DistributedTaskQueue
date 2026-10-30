@@ -15,11 +15,9 @@ type ErrorResponse struct {
 	Error string `json:"error" binding:"required"`
 }
 type CreateTaskRequest struct {
-	ParentIDs  []uuid.UUID     `json:"parent_ids"`
-	TaskType   string          `json:"task_type" binding:"required"`
-	QueueName  string          `json:"queue_name"`
-	Payload    json.RawMessage `json:"payload"`
-	MaxRetries int             `json:"max_retries"`
+	ParentIDs []uuid.UUID     `json:"parent_ids"`
+	TaskType  string          `json:"task_type" binding:"required"`
+	Payload   json.RawMessage `json:"payload"`
 }
 
 type WorkflowResponse struct {

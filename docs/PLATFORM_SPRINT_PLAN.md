@@ -9,6 +9,9 @@ REST security contract: [REST_API_AUTH_DESIGN.md](REST_API_AUTH_DESIGN.md).
 This file is the project's sprint plan; keep these links as the single source
 rather than maintaining a second divergent SPRINT_PLAN.md.
 
+Deployment and release boundaries clarified on 28 October 2026; story
+completion and the current S1-01 implementation scope are unchanged.
+
 ## 1. Delivery strategy
 
 Build a reliable Go queue and authenticated Go worker SDK before Saga and
@@ -16,12 +19,20 @@ scale work. Optimize measured scheduling overhead, not just database INSERTs.
 Temporal, River and BullMQ are comparison points, not interchangeable feature
 sets or evidence of this platform's capacity.
 
+V1 serves independent tenants on a shared platform. All workers are trusted
+deployments operated by the platform team; tenant-operated workers and
+customer worker enrollment are outside v1. Keep REST/storage ownership and
+business-object checks tenant-scoped even when workers serve multiple tenants.
+
 Planning assumption: two-week sprints, four-to-six engineers, approximately
 25–35 engineering days of committed work per sprint after review/on-call/test
 work. Estimates below are initial engineer-day ranges, not delivery promises;
 dependencies and correctness gates take precedence over the sprint calendar.
 If measured work exceeds capacity, move whole dependent stories to the next
 sprint. Do not reduce security, fault tests or durability to preserve a date.
+Treat sprint numbers as milestones until named owners validate the critical
+path and within-story parallelism, especially S3 session -> outcome -> fault
+matrix work. Aggregate engineer-days alone do not establish a two-week schedule.
 
 | Lane | Suggested staffing | Owns |
 | --- | --- | --- |
@@ -48,6 +59,11 @@ a different engineer reviews security and state-machine changes.
 - Sprint 6: Saga feature release candidate, separate from basic queue release.
 - Sprint 7: operational/capacity sign-off, not a promise of unlimited scale.
 
+The basic queue/SDK production release requires S4, S5-03 real-storage
+evidence for object-result routes, and S7 sign-off for its supported workloads.
+Run these gates without waiting for media or Saga; those features require
+their own S5/S6 evidence and applicable operational sign-off before enablement.
+
 Existing primitives include durable outbox generations, DB leases,
 ClaimPendingOutbox and protobuf definitions. Reuse them; do not mark the
 corresponding stories done without proving the connected flow. Existing
@@ -57,6 +73,8 @@ instruction to recreate them.
 ### Definition of done for every story
 
 - Check in the expected artifact and link the relevant SDK/REST contract.
+- Update affected usage/configuration examples as each story lands; S7-03 is
+  the final release walkthrough, not a reason to defer current documentation.
 - Test success, boundary, concurrent race, retry and relevant crash window.
   Never postpone a security/correctness test to a later sprint.
 - Interpret concurrency caps as bounds on authorized attempts, not proof that
@@ -203,6 +221,9 @@ Scope: worker.proto, build/generation CI, SDK design and schema ADR.
 
 Tasks and expected outputs:
 
+- [ ] Record the shared-tenant, trusted platform-worker boundary in the protocol
+  review; retain service/capability authorization and tenant-scoped business
+  checks. Tenant-owned worker identity/enrollment is outside v1.
 - [ ] Reconcile existing six RPCs with SDK sections 3–8; add server-derived
   tenant_id, ResultContract, server_time, handler_deadline and non-mutating
   receipt_only fields additively.
@@ -382,8 +403,9 @@ Scope: cmd/gateway, internal/gateway auth/session, repository/migrations, TLS de
 
 Tasks and expected outputs:
 
-- [ ] Implement principal-derived capability/service policy, mTLS-only ingress
-  and Register/Renew with durable token HMACs and immutable authorization.
+- [ ] Implement operator-provisioned platform-worker principals with
+  capability/service policy, mTLS-only ingress and Register/Renew with durable
+  token HMACs and immutable authorization.
 - [ ] Validate current principal/policy, expiry and revocation on every RPC
   and mutation commit across replicas; no metadata-based privilege.
 - [ ] Implement soft/hard expiry and current-policy renewal; no new session
@@ -673,8 +695,12 @@ target, not a published customer SLA.
 
 ### S5-03 — Object-storage failure and cleanup validation
 
-P0 · Owner R/W · 3–4 days · Dependencies: S3-03, S5-01.
+P0 · Owner R/W · 3–4 days · Dependencies: S3-03/S3-04 and the real artifact adapter.
 Scope: result adapter/SDK integration fixtures and object lifecycle operations.
+
+Run object-result fixtures before S5-01 when needed for basic production
+sign-off. Repeat with the real media worker after S5-01; media-specific process
+evidence remains required for media support.
 
 Tasks and expected outputs:
 
@@ -690,8 +716,9 @@ Tasks and expected outputs:
 
 Patterns: immutable artifact, least privilege, reference-aware garbage collection.
 Expected result: large results do not weaken fencing or leave unbounded debt.
-Acceptance evidence: C10/C12/C15 with real storage semantics; no result deleted
-while referenced, and no staging overwrite changes a committed outcome.
+Acceptance evidence: C10/C12/C21 and C15 object-lifetime/drain cases with real
+storage semantics; no result deleted while referenced, and no staging overwrite
+changes a committed outcome. Media process-tree C15 evidence remains in S5-01.
 
 Sprint 5 exit: separate email/media performance evidence, real process
 cancellation and artifact lifecycle validated. Do not add a second language
@@ -775,9 +802,14 @@ failure and reaches a truthful terminal or remediation state.
 
 ## 8. Sprint 7 — Capacity envelope and operational sign-off
 
+Schedule basic queue/SDK sign-off after S4 and applicable S5-03 evidence,
+independently of media/Saga delivery. Repeat feature-specific evidence before
+expanding the supported workload envelope.
+
 ### S7-01 — Profile before scaling
 
-P2 · Owner P/R · 3–5 days · Dependencies: stable S4/S5 path.
+P2 · Owner P/R · 3–5 days · Dependencies: stable S4 path;
+S5-02 additionally required for media/mixed-media capacity claims.
 Scope: profiling, query plans/indexes, relay/pool configuration and evidence.
 
 Tasks and expected outputs:
@@ -813,8 +845,9 @@ Tasks and expected outputs:
 - [ ] Have the product/operations owner approve actual RPO/RTO and retry/
   history/idempotency retention before launch; backup-only restore cannot
   honestly promise zero loss of writes newer than that backup.
-- [ ] Add recovery, credential compromise, stuck workflow, failed compensation,
-  saturated pool and cleanup backlog runbooks with permission boundaries.
+- [ ] Add recovery, credential compromise, stuck workflow, saturated pool and
+  cleanup backlog runbooks with permission boundaries; require the failed
+  compensation runbook before enabling Saga.
 
 Patterns: reconciliation, disaster recovery, least privilege.
 Expected result: failures have a tested operator path and truthful durability claim.
@@ -846,13 +879,15 @@ security, durability or performance statements.
 
 ### S7-04 — Published benchmark and launch decision
 
-P1 for capacity claim · Owner R, P/W review · 2–4 days · Dependencies: S7-01/S7-02.
+P1 for capacity claim · Owner R, P/W review · 2–4 days · Dependencies:
+S7-01/S7-02/S7-03 and S5-03 real-storage evidence for object-result routes.
 Scope: benchmark scripts/raw results/report and release decision record.
 
 Tasks and expected outputs:
 
-- [ ] Execute the common benchmark protocol below for reference, email fixture,
-  media and mixed tenant/workflow workloads with multiple replicas.
+- [ ] Execute the common benchmark protocol below for reference, email fixture
+  and mixed tenant/workflow workloads with multiple replicas. Add media and
+  mixed-media runs after S5 before enabling or claiming media support.
 - [ ] Publish offered/accepted/completed rates, p50/p95/p99, errors, duplicates,
   backlog slope, recovery time and resource costs; include failed runs.
 - [ ] Separate scheduler overhead from business/provider time and repository
@@ -908,13 +943,15 @@ S1: routing + authenticated REST + isolated baseline + protocol freeze
   -> S2: atomic lifecycle + shared admission + relay/repair
   -> S3: authenticated Gateway + SDK + durable results/outcomes
   -> S4: supported SDK + idempotent service + canary
-  -> S5: resource-heavy workload isolation
-  -> S6: Saga (separate feature gate)
-  -> S7: capacity/operations sign-off
+       -> S5-03: real-storage validation (can run before media)
+          -> S7: basic queue/SDK capacity + operations sign-off
+       -> S5-01/S5-02: media isolation -> media operational sign-off
+       -> S6: Saga -> Saga operational sign-off
 
-S7 operational preparation may start earlier; launch cannot bypass its gate.
-Saga is not required to ship the basic queue/worker SDK, but cannot be advertised
-until S6 passes.
+Media support also requires S5-03. Heavy Saga participants require S5 isolation.
+S7 operational preparation may start earlier; each release must pass its
+applicable gates. Media and Saga are not prerequisites for basic queue/SDK
+production, and cannot be advertised until their own gates pass.
 ```
 
 ## 10. Audit-to-story traceability
