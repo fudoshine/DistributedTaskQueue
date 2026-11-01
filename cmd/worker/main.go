@@ -86,6 +86,12 @@ func processDelivery(ctx context.Context, catalog *execution.Catalog, queueName,
 	if cbErr != nil {
 		claimErr = cbErr
 	}
+	taskID, err := uuid.Parse(delivery.TaskID)
+	if err != nil {
+		slog.Error("invalid task ID",
+			"taskId", delivery.TaskID, "error", err)
+		return
+	}
 	if claimErr != nil {
 		switch {
 		case errors.Is(claimErr, repository.ErrJobAlreadyOwned),
@@ -96,11 +102,21 @@ func processDelivery(ctx context.Context, catalog *execution.Catalog, queueName,
 			// This Stream entry cannot become the current execution any more.
 			acknowledge(ctx, store, queueName, delivery)
 			return
-		case errors.Is(claimErr, repository.ErrJobNotFound):
-			slog.Error("stream delivery has no job row; moving to DLQ", "taskId", delivery.TaskID)
-			if err := store.MoveToDeadLetterQueue(ctx, queueName, delivery); err == nil {
-				acknowledge(ctx, store, queueName, delivery)
+		case errors.Is(claimErr, repository.ErrJobNotFound),
+			errors.Is(claimErr, repository.ErrRouteMismatch):
+
+			slog.Error("quarantining invalid delivery",
+				"taskId", delivery.TaskID,
+				"stream", queueName,
+				"error", claimErr)
+
+			if err := store.MoveToDeadLetterQueue(ctx, queueName, delivery); err != nil {
+				slog.Error("quarantine delivery failed",
+					"taskId", delivery.TaskID, "error", err)
+				return
 			}
+
+			acknowledge(ctx, store, queueName, delivery)
 			return
 		default:
 			// Leave PEL entry unacked. XAUTOCLAIM and the durable DB recovery
@@ -109,13 +125,6 @@ func processDelivery(ctx context.Context, catalog *execution.Catalog, queueName,
 			return
 		}
 	}
-	taskID, err := uuid.Parse(delivery.TaskID)
-	if err != nil {
-		slog.Error("invalid task ID",
-			"taskId", delivery.TaskID, "error", err)
-		return
-	}
-
 	stored, err := jobs.GetTask(ctx, taskID)
 	if err != nil {
 		slog.Warn("load claimed job",

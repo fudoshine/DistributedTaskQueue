@@ -141,7 +141,7 @@ func TestSingleAttemptContractFailsWithoutRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	claim, err := sharedRepo.TryStartJob(t.Context(), queueName, job.ID.String(), deliveryID.String(), 0, contract.LeaseTTL)
+	claim, err := sharedRepo.TryStartJob(t.Context(), contract.CapabilityStream, job.ID.String(), deliveryID.String(), 0, contract.LeaseTTL)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -24,6 +24,8 @@ var (
 	ErrLeaseLost       = errors.New("job execution skipped: lease is no longer owned by this attempt")
 	ErrStaleDelivery   = errors.New("job execution skipped: delivery is no longer current")
 	ErrRelayLeaseLost  = errors.New("outbox relay no longer owns this delivery")
+	ErrRouteMismatch   = errors.New("job route does not match delivery stream")
+
 	// ErrJobNotFound means TryStartJob was called for a taskID with no
 	// corresponding processed_jobs row. Under this system's design that
 	// should never happen — every task is created in Postgres via CreateJob
@@ -269,6 +271,7 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID, deli
 			    AND delivery.delivery_id = $8
 		  )
 		  AND job.available_at <= NOW()
+		  AND job.execution_contract->>'capability_stream' = $9
 		  AND NOT EXISTS (
 			  SELECT 1
 			  FROM job_dependencies edge
@@ -278,7 +281,7 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID, deli
 		  )
 		RETURNING lease_token, attempt_number;
 		`
-	err = tx.QueryRow(ctx, query, id, domain.TaskStatusRunning, claim.LeaseToken, leaseTTL.String(), domain.TaskStatusQueued, domain.TaskStatusCompleted, generation, parsedDeliveryID).Scan(&claim.LeaseToken, &claim.Attempt)
+	err = tx.QueryRow(ctx, query, id, domain.TaskStatusRunning, claim.LeaseToken, leaseTTL.String(), domain.TaskStatusQueued, domain.TaskStatusCompleted, generation, parsedDeliveryID, queueName).Scan(&claim.LeaseToken, &claim.Attempt)
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
@@ -287,19 +290,28 @@ func (r *JobRepository) TryStartJob(ctx context.Context, queueName, taskID, deli
 
 		var status domain.TaskStatus
 		var currentGeneration int
-		err = tx.QueryRow(ctx, `SELECT status, delivery_generation FROM processed_jobs WHERE id = $1;`, id).Scan(&status, &currentGeneration)
+		var savedStream *string
+
+		err = tx.QueryRow(ctx, `
+			SELECT status, delivery_generation,
+				execution_contract->>'capability_stream'
+			FROM processed_jobs
+			WHERE id = $1;
+		`, id).Scan(&status, &currentGeneration, &savedStream)
 		if errors.Is(err, pgx.ErrNoRows) {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
 			return JobClaim{}, ErrJobNotFound
-		}
-		if currentGeneration != generation {
-			return JobClaim{}, ErrStaleDelivery
 		}
 		if err != nil {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "TryStartJob").Inc()
 			return JobClaim{}, fmt.Errorf("failed to inspect unclaimable job %s: %w", taskID, err)
 		}
-
+		if savedStream == nil || *savedStream != queueName {
+			return JobClaim{}, ErrRouteMismatch
+		}
+		if currentGeneration != generation {
+			return JobClaim{}, ErrStaleDelivery
+		}
 		switch status {
 		case domain.TaskStatusCompleted:
 			metrics.JobsDuplicateSkipped.WithLabelValues(queueName).Inc()

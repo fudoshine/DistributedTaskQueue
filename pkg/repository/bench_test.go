@@ -183,7 +183,7 @@ func BenchmarkTryStartJob(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		claim, err := sharedRepo.TryStartJob(ctx, "queue:bench",
+		claim, err := sharedRepo.TryStartJob(ctx, contract.CapabilityStream,
 			entries[i].taskID.String(), entries[i].deliveryID.String(), 0, 30*time.Second)
 		if err != nil {
 			b.Fatalf("claim job: %v", err)
@@ -304,7 +304,7 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 			if i >= len(entries) {
 				return
 			}
-			claim, err := sharedRepo.TryStartJob(ctx, "queue:bench",
+			claim, err := sharedRepo.TryStartJob(ctx, contract.CapabilityStream,
 				entries[i].taskID.String(), entries[i].deliveryID.String(), 0, 30*time.Second)
 			if err != nil {
 				b.Errorf("claim job: %v", err)
@@ -404,7 +404,7 @@ func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get delivery ID: %v", err)
 	}
-	if _, err := sharedRepo.TryStartJob(ctx, "queue:recover", taskID.String(), deliveryID.String(), 0, time.Minute); err != nil {
+	if _, err := sharedRepo.TryStartJob(ctx, contract.CapabilityStream, taskID.String(), deliveryID.String(), 0, time.Minute); err != nil {
 		t.Fatalf("claim job: %v", err)
 	}
 
