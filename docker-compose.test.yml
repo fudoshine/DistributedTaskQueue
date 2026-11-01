@@ -1,0 +1,14 @@
+services:
+  postgres-test:
+    image: postgres:14-alpine
+    environment:
+      POSTGRES_DB: task_queue_test
+      POSTGRES_USER: queue_test
+      POSTGRES_PASSWORD: local_test_password
+    ports:
+      - "127.0.0.1:55432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U queue_test -d task_queue_test"]
+      interval: 2s
+      timeout: 5s
+      retries: 15

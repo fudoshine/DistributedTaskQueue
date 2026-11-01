@@ -36,7 +36,7 @@ func TestClaimIdleDeliveriesAdvancesCursor(t *testing.T) {
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		t.Fatalf("connect Redis: %v", err)
 	}
-	queueName := fmt.Sprintf("queue:cursor-test:%d", time.Now().UnixNano())
+	queueName := fmt.Sprintf("queue:cursor-test:%d:stream", time.Now().UnixNano())
 	store := &RedisStore{rdb: rdb, cursors: make(map[string]string)}
 	t.Cleanup(func() {
 		_ = rdb.Del(ctx, streamKey(queueName)).Err()
@@ -77,5 +77,33 @@ func TestParseDeliveryRejectsInvalidGeneration(t *testing.T) {
 	}})
 	if err == nil {
 		t.Fatal("expected invalid generation error")
+	}
+}
+
+func TestCatalogRouteKeys(t *testing.T) {
+	const streamName = "queue:reference.echo:v1:r1:stream"
+	if got := streamKey(streamName); got != streamName {
+		t.Errorf("stream key = %q, want %q", got, streamName)
+	}
+	if got := groupName(streamName); got != "queue:reference.echo:v1:r1:workers" {
+		t.Errorf("group name = %q, want %q", got, "queue:reference.echo:v1:r1:workers")
+	}
+	if got := dlqKey(streamName); got != "queue:reference.echo:v1:r1:dlq" {
+		t.Errorf("DLQ key = %q, want %q", got, "queue:reference.echo:v1:r1:dlq")
+	}
+}
+
+func TestConsumeDeliveryReturnsReadError(t *testing.T) {
+	rdb := redisclient.NewClient(&redisclient.Options{})
+	if err := rdb.Close(); err != nil {
+		t.Fatalf("close client: %v", err)
+	}
+
+	store := &RedisStore{rdb: rdb}
+	_, err := store.ConsumeDelivery(
+		context.Background(), "queue:test:stream", "consumer",
+	)
+	if err == nil {
+		t.Fatal("expected read error from closed client")
 	}
 }

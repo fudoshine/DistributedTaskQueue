@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/circuitbreaker"
 	"distributed-queue/pkg/config"
 	"distributed-queue/pkg/redis"
@@ -192,11 +193,18 @@ func processDelivery(ctx context.Context, queueName, consumer string, leaseTTL t
 	acknowledge(ctx, store, queueName, delivery)
 }
 
-func runWorker(ctx context.Context, queueName, consumer string, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
+func runWorker(ctx context.Context, routes []execution.CatalogEntry, consumer string, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("stream worker started", "consumer", consumer)
+	if routes == nil || len(routes) == 0 {
+		slog.Warn("no catalog routes; worker will not process any deliveries")
+		return
+	}
+	nextRoute := 0
 	for ctx.Err() == nil {
-		delivery, err := store.ConsumeDelivery(ctx, queueName, consumer)
+		route := routes[nextRoute]
+		nextRoute = (nextRoute + 1) % len(routes)
+		delivery, err := store.ConsumeDelivery(ctx, route.CapabilityStream, consumer)
 		if err != nil {
 			if ctx.Err() != nil {
 				return
@@ -212,7 +220,7 @@ func runWorker(ctx context.Context, queueName, consumer string, leaseTTL time.Du
 		if delivery.StreamID == "" {
 			continue
 		}
-		processDelivery(ctx, queueName, consumer, leaseTTL, store, jobs, dbBreaker, delivery)
+		processDelivery(ctx, route.CapabilityStream, consumer, route.LeaseTTL, store, jobs, dbBreaker, delivery)
 	}
 }
 
@@ -246,27 +254,30 @@ func runOutboxRelay(ctx context.Context, interval, leaseTTL time.Duration, store
 	}
 }
 
-func runJanitor(ctx context.Context, queueName string, interval, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, wg *sync.WaitGroup) {
+func runJanitor(ctx context.Context, routes []execution.CatalogEntry, interval time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, wg *sync.WaitGroup) {
 	defer wg.Done()
 	sweep := func() {
-		if recovered, err := jobs.RecoverExpiredLeases(ctx, queueName, recoveryBatchSize); err != nil {
+		if recovered, err := jobs.RecoverExpiredLeases(ctx, recoveryBatchSize); err != nil {
 			slog.Error("recover expired DB leases", "error", err)
 		} else if len(recovered) > 0 {
 			slog.Warn("scheduled expired job recoveries", "count", len(recovered))
 		}
-		idle, err := store.ClaimIdleDeliveries(ctx, queueName, leaseTTL, recoveryBatchSize)
-		if err != nil {
-			slog.Error("claim idle PEL deliveries", "error", err)
-			return
-		}
-		for _, delivery := range idle {
-			action, err := jobs.RecoverIdleDelivery(ctx, queueName, delivery.TaskID, delivery.Generation)
+		for _, route := range routes {
+			idle, err := store.ClaimIdleDeliveries(ctx, route.CapabilityStream, route.LeaseTTL, recoveryBatchSize)
 			if err != nil {
-				slog.Warn("recover idle delivery", "streamId", delivery.StreamID, "error", err)
+				slog.Error("claim idle PEL deliveries",
+					"stream", route.CapabilityStream, "error", err)
 				continue
 			}
-			if action != repository.RecoveryKeepInflight {
-				acknowledge(ctx, store, queueName, delivery)
+			for _, delivery := range idle {
+				action, err := jobs.RecoverIdleDelivery(ctx, route.CapabilityStream, delivery.TaskID, delivery.Generation)
+				if err != nil {
+					slog.Warn("recover idle delivery", "streamId", delivery.StreamID, "error", err)
+					continue
+				}
+				if action != repository.RecoveryKeepInflight {
+					acknowledge(ctx, store, route.CapabilityStream, delivery)
+				}
 			}
 		}
 	}
@@ -285,7 +296,7 @@ func runJanitor(ctx context.Context, queueName string, interval, leaseTTL time.D
 	}
 }
 
-func runDepthCollector(ctx context.Context, queueName string, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
+func runDepthCollector(ctx context.Context, routes []execution.CatalogEntry, interval time.Duration, store *redis.RedisStore, wg *sync.WaitGroup) {
 	defer wg.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -294,8 +305,11 @@ func runDepthCollector(ctx context.Context, queueName string, interval time.Dura
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if err := store.CollectDepths(ctx, queueName); err != nil {
-				slog.Warn("collect queue depths", "error", err)
+			for _, route := range routes {
+				if err := store.CollectDepths(ctx, route.CapabilityStream); err != nil {
+					slog.Warn("collect queue depths",
+						"stream", route.CapabilityStream, "error", err)
+				}
 			}
 		}
 	}
@@ -330,6 +344,12 @@ func main() {
 		slog.Error("load config", "error", err)
 		return
 	}
+	catalog, err := execution.NewCatalog()
+	if err != nil {
+		slog.Error("load execution catalog", "error", err)
+		return
+	}
+	routes := catalog.Routes()
 	store, err := redis.NewRedisStore(ctx, cfg.Redis, cfg.Queue.HoldTTL)
 	if err != nil {
 		slog.Error("connect Redis", "error", err)
@@ -346,9 +366,12 @@ func main() {
 		return
 	}
 	defer pool.Close()
-	if err := store.EnsureConsumerGroup(ctx, cfg.Queue.Name); err != nil {
-		slog.Error("initialize stream group", "error", err)
-		return
+	for _, route := range routes {
+		if err := store.EnsureConsumerGroup(ctx, route.CapabilityStream); err != nil {
+			slog.Error("initialize catalog stream group",
+				"stream", route.CapabilityStream, "error", err)
+			return
+		}
 	}
 	jobs := repository.NewJobRepository(pool)
 	breaker := circuitbreaker.New(5, 30*time.Second)
@@ -356,11 +379,11 @@ func main() {
 	workerCount := cfg.Worker.Count
 	wg.Add(workerCount + 4)
 	for i := 0; i < workerCount; i++ {
-		go runWorker(ctx, cfg.Queue.Name, fmt.Sprintf("worker-%s-%d", uuid.NewString(), i), cfg.Queue.HoldTTL, store, jobs, breaker, &wg)
+		go runWorker(ctx, routes, fmt.Sprintf("worker-%s-%d", uuid.NewString(), i), store, jobs, breaker, &wg)
 	}
 	go runOutboxRelay(ctx, time.Second, cfg.Queue.HoldTTL, store, jobs, &wg)
-	go runJanitor(ctx, cfg.Queue.Name, cfg.Queue.JanitorInterval, cfg.Queue.HoldTTL, store, jobs, &wg)
-	go runDepthCollector(ctx, cfg.Queue.Name, cfg.Queue.DepthPollEvery, store, &wg)
+	go runJanitor(ctx, routes, cfg.Queue.JanitorInterval, store, jobs, &wg)
+	go runDepthCollector(ctx, routes, cfg.Queue.DepthPollEvery, store, &wg)
 	go runMetricsServer(ctx, cfg.Metrics.Addr, &wg)
 	<-ctx.Done()
 	done := make(chan struct{})

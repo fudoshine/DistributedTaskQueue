@@ -434,7 +434,15 @@ func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
 	if recoveryDeliveries != 1 {
 		t.Fatalf("recovery deliveries = %d, want 1", recoveryDeliveries)
 	}
-
+	var queueName string
+	err = sharedPool.QueryRow(ctx, `SELECT queue_name FROM outbox WHERE task_id=$1 AND generation =1`, taskID).Scan(&queueName)
+	if err != nil {
+		t.Fatalf("check recovery outbox: %v", err)
+	}
+	if queueName != contract.CapabilityStream {
+		t.Fatalf("idle recovery queue = %q, want saved stream %q",
+			queueName, contract.CapabilityStream)
+	}
 	stored, err := sharedRepo.GetTask(ctx, taskID)
 	if err != nil {
 		t.Fatal(err)

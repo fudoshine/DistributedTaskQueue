@@ -81,6 +81,28 @@ func TestCreateJobPinsExecutionContract(t *testing.T) {
 				row.EffectKey == nil || *row.EffectKey != effectKey || row.MaxRetries != contract.MaxAttempts {
 				t.Fatalf("accepted metadata did not round trip: %+v", row)
 			}
+			var actual, expected any
+
+			if err := json.Unmarshal(row.Payload, &actual); err != nil {
+				t.Fatalf("invalid stored payload: %v", err)
+			}
+
+			if err := json.Unmarshal([]byte(`{"message":"hello"}`), &expected); err != nil {
+				t.Fatal(err)
+			}
+
+			if !reflect.DeepEqual(actual, expected) {
+				t.Fatalf("payload mismatch: got %v, want %v", actual, expected)
+			}
+		}
+		var queueName string
+		err = sharedPool.QueryRow(t.Context(), `SELECT queue_name FROM outbox WHERE task_id=$1 AND generation=0`, result.ID).Scan(&queueName)
+		if err != nil {
+			t.Fatalf("check recovery outbox: %v", err)
+		}
+		if queueName != contract.CapabilityStream {
+			t.Fatalf("root outbox queue = %q, want saved stream %q",
+				queueName, contract.CapabilityStream)
 		}
 		if i == 0 {
 			firstID, firstEffectKey = result.ID, effectKey

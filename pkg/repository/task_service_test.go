@@ -189,8 +189,8 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 					`SELECT queue_name FROM outbox WHERE task_id = $1 AND generation = 0`, result.ID).Scan(&storedQueue); err != nil {
 					t.Fatal(err)
 				}
-				if storedQueue != queueName {
-					t.Fatalf("outbox queue = %q, want configured queue %q", storedQueue, queueName)
+				if storedQueue != contract.CapabilityStream {
+					t.Fatalf("outbox queue = %q, want catalog stream %q", storedQueue, contract.CapabilityStream)
 				}
 				added = 1
 			} else {

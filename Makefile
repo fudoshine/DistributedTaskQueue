@@ -17,3 +17,13 @@ proto-breaking:
 
 lint:
 	$(GOLANGCI_LINT) run ./...
+
+
+.PHONY: test-integration
+
+test-integration:
+	@set -eu; \
+	set -a; \
+	. ./.env.test.local; \
+	set +a; \
+	go test ./pkg/repository -count=1 -v

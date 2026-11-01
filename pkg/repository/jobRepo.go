@@ -66,6 +66,7 @@ type JobRow struct {
 	ExecutionContract *execution.CatalogEntry
 	EffectKey         *uuid.UUID
 	Status            domain.TaskStatus
+	Payload           json.RawMessage
 	CurrentRetries    int
 	MaxRetries        int
 	ErrorLog          *string
@@ -178,7 +179,7 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 		                            execution_contract, effect_key)
 		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		RETURNING id, workflow_id, task_type, tenant_id, execution_contract, effect_key,
-		          status, current_retries, max_retries, error_log, created_at, processed_at, available_at;
+		          status, task_details, current_retries, max_retries, error_log, created_at, processed_at, available_at;
 	`
 	err = tx.QueryRow(ctx, query,
 		task.ID, task.WorkflowID, task.TaskType, status, payload, task.ExecutionContract.MaxAttempts,
@@ -186,7 +187,7 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 	).Scan(
 		&jobRow.ID, &jobRow.WorkflowID, &jobRow.TaskType,
 		&jobRow.TenantID, &jobRow.ExecutionContract, &jobRow.EffectKey,
-		&jobRow.Status, &jobRow.CurrentRetries, &jobRow.MaxRetries, &jobRow.ErrorLog,
+		&jobRow.Status, &jobRow.Payload, &jobRow.CurrentRetries, &jobRow.MaxRetries, &jobRow.ErrorLog,
 		&jobRow.CreatedAt, &jobRow.ProcessedAt, &jobRow.AvailableAt,
 	)
 	if err != nil {
@@ -211,7 +212,7 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 		// Root task (no parents) — write outbox row in the same transaction.
 		// The outbox relay will enqueue this to Redis. This guarantees atomicity:
 		// either both processed_jobs and outbox land, or neither does.
-		_, err = insertDelivery(ctx, tx, task.ID, queueName, 0, time.Now())
+		_, err = insertDelivery(ctx, tx, task.ID, task.ExecutionContract.CapabilityStream, 0, time.Now())
 		if err != nil {
 			metrics.JobRepoErrors.WithLabelValues(queueName, "CreateJob").Inc()
 			return JobRow{}, fmt.Errorf("failed to write outbox row for task %s: %w", task.ID, err)
@@ -360,12 +361,14 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 		  AND status = $5
 		  AND lease_token = $6
 		  AND lease_expires_at > NOW()
-		RETURNING current_retries, max_retries, status, delivery_generation, available_at;
+		RETURNING current_retries, max_retries, status, delivery_generation, available_at,
+				execution_contract->>'capability_stream';
 	`
 	var status domain.TaskStatus
 	var generation int
 	var availableAt time.Time
-	err = tx.QueryRow(ctx, query, id, errLog, domain.TaskStatusFailed, domain.TaskStatusQueued, domain.TaskStatusRunning, leaseToken).Scan(&currentRetries, &maxRetries, &status, &generation, &availableAt)
+	var capabilityStream string
+	err = tx.QueryRow(ctx, query, id, errLog, domain.TaskStatusFailed, domain.TaskStatusQueued, domain.TaskStatusRunning, leaseToken).Scan(&currentRetries, &maxRetries, &status, &generation, &availableAt, &capabilityStream)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, 0, ErrLeaseLost
@@ -374,7 +377,7 @@ func (r *JobRepository) RecordFailure(ctx context.Context, queueName, taskID str
 		return 0, 0, fmt.Errorf("failed to record failure for task %s: %w", taskID, err)
 	}
 	if status == domain.TaskStatusQueued {
-		if _, err := insertDelivery(ctx, tx, id, queueName, generation, availableAt); err != nil {
+		if _, err := insertDelivery(ctx, tx, id, capabilityStream, generation, availableAt); err != nil {
 			return 0, 0, fmt.Errorf("schedule retry delivery: %w", err)
 		}
 	}
@@ -541,13 +544,13 @@ func (r *JobRepository) CompleteJobAndScheduleChildren(ctx context.Context, queu
 			    available_at = NOW()
 			FROM ready_children ready
 			WHERE child.id = ready.id AND child.status = $2
-			RETURNING child.id
+			RETURNING child.id,child.execution_contract->>'capability_stream' AS capability_stream
 		)
 		INSERT INTO outbox (task_id, queue_name, delivery_id, generation, not_before, delivered)
-		SELECT id, $5, uuid_generate_v4(), 0, NOW(), FALSE FROM promoted_children
+		SELECT id, capability_stream, uuid_generate_v4(), 0, NOW(), FALSE FROM promoted_children
 		ON CONFLICT (task_id, generation) DO NOTHING
 		RETURNING task_id;
-	`, id, domain.TaskStatusPending, domain.TaskStatusCompleted, domain.TaskStatusQueued, queueName)
+	`, id, domain.TaskStatusPending, domain.TaskStatusCompleted, domain.TaskStatusQueued)
 	if err != nil {
 		metrics.JobRepoErrors.WithLabelValues(queueName, "CompleteJobAndScheduleChildren").Inc()
 		return nil, fmt.Errorf("failed to schedule children of job %s: %w", taskID, err)
@@ -783,7 +786,7 @@ func (r *JobRepository) ReleaseOutboxLease(ctx context.Context, outboxID, relayT
 // RecoverExpiredLeases durably schedules a new delivery generation for every
 // expired running attempt. It does not depend on Redis pending state, so a
 // broker outage or a lost old PEL entry cannot strand a RUNNING job.
-func (r *JobRepository) RecoverExpiredLeases(ctx context.Context, queueName string, limit int) ([]Delivery, error) {
+func (r *JobRepository) RecoverExpiredLeases(ctx context.Context, limit int) ([]Delivery, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("recovery limit must be positive")
 	}
@@ -800,14 +803,14 @@ func (r *JobRepository) RecoverExpiredLeases(ctx context.Context, queueName stri
 			SET status = $3, available_at = NOW(), lease_token = NULL, lease_expires_at = NULL,
 			    delivery_generation = expired.next_generation
 			FROM expired WHERE job.id = expired.id
-			RETURNING job.id, job.delivery_generation
+			RETURNING job.id, job.delivery_generation, job.execution_contract->>'capability_stream' AS capability_stream
 		), published AS (
 			INSERT INTO outbox (task_id, queue_name, delivery_id, generation, not_before, delivered)
-			SELECT id, $4, uuid_generate_v4(), delivery_generation, NOW(), FALSE FROM recovered
+			SELECT id, capability_stream, uuid_generate_v4(), delivery_generation, NOW(), FALSE FROM recovered
 			RETURNING id, task_id, delivery_id, generation, queue_name
 		)
 		SELECT id, task_id, delivery_id, generation, queue_name FROM published;
-	`, domain.TaskStatusRunning, limit, domain.TaskStatusQueued, queueName)
+	`, domain.TaskStatusRunning, limit, domain.TaskStatusQueued)
 	if err != nil {
 		return nil, fmt.Errorf("recover expired leases: %w", err)
 	}
@@ -840,10 +843,11 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 	var status domain.TaskStatus
 	var currentGeneration int
 	var availableAt time.Time
+	var capabilityStream string
 	err = tx.QueryRow(ctx, `
-		SELECT status, delivery_generation, available_at
+		SELECT status, delivery_generation, available_at, execution_contract->>'capability_stream'
 		FROM processed_jobs WHERE id = $1 FOR UPDATE;
-	`, id).Scan(&status, &currentGeneration, &availableAt)
+	`, id).Scan(&status, &currentGeneration, &availableAt, &capabilityStream)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return RecoveryAcknowledge, nil
 	}
@@ -871,7 +875,7 @@ func (r *JobRepository) RecoverIdleDelivery(ctx context.Context, queueName, task
 		// owned by its worker even when the janitor host clock is ahead.
 		return RecoveryKeepInflight, nil
 	}
-	if _, err := insertDelivery(ctx, tx, id, queueName, nextGeneration, availableAt); err != nil {
+	if _, err := insertDelivery(ctx, tx, id, capabilityStream, nextGeneration, availableAt); err != nil {
 		return RecoveryKeepInflight, fmt.Errorf("schedule recovered delivery: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -946,14 +950,14 @@ func (r *JobRepository) GetTask(ctx context.Context, taskID uuid.UUID) (JobRow, 
 	}
 
 	var task JobRow
-	query := `SELECT id, workflow_id, task_type, tenant_id, execution_contract, effect_key, status, current_retries, max_retries,
+	query := `SELECT id, workflow_id, task_type, tenant_id, execution_contract, effect_key, status,task_details, current_retries, max_retries,
           error_log, created_at, processed_at, available_at
 		  FROM processed_jobs
 		  WHERE id = $1;`
 	err := r.pool.QueryRow(ctx, query, taskID).Scan(
 		&task.ID, &task.WorkflowID, &task.TaskType,
 		&task.TenantID, &task.ExecutionContract, &task.EffectKey,
-		&task.Status,
+		&task.Status, &task.Payload,
 		&task.CurrentRetries, &task.MaxRetries,
 		&task.ErrorLog, &task.CreatedAt, &task.ProcessedAt, &task.AvailableAt,
 	)

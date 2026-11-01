@@ -6,6 +6,7 @@ import (
 	"distributed-queue/pkg/redis/metrics"
 	"fmt"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -40,9 +41,11 @@ func NewRedisStore(ctx context.Context, cfg config.RedisConfig, _ time.Duration)
 
 func (s *RedisStore) Close() error { return s.rdb.Close() }
 
-func streamKey(queueName string) string { return queueName + ":stream" }
-func groupName(queueName string) string { return queueName + ":workers" }
-func dlqKey(queueName string) string    { return queueName + ":dlq" }
+func streamKey(streamName string) string { return streamName }
+func groupName(streamName string) string {
+	return strings.TrimSuffix(streamName, ":stream") + ":workers"
+}
+func dlqKey(streamName string) string { return strings.TrimSuffix(streamName, ":stream") + ":dlq" }
 
 func (s *RedisStore) EnsureConsumerGroup(ctx context.Context, queueName string) error {
 	err := s.rdb.XGroupCreateMkStream(ctx, streamKey(queueName), groupName(queueName), "0").Err()
@@ -83,12 +86,20 @@ func (s *RedisStore) ConsumeDelivery(ctx context.Context, queueName, consumer st
 		Group: groupName(queueName), Consumer: consumer,
 		Streams: []string{streamKey(queueName), ">"}, Count: 1, Block: time.Second,
 	}).Result()
-	if err == redisclient.Nil || len(streams) == 0 || len(streams[0].Messages) == 0 {
+	if err == redisclient.Nil {
 		return Delivery{}, nil
 	}
 	if err != nil {
 		metrics.StoreErrors.WithLabelValues(queueName, "ConsumeDelivery").Inc()
 		return Delivery{}, fmt.Errorf("read stream delivery: %w", err)
+	}
+	if len(streams) == 0 || len(streams[0].Messages) == 0 {
+		return Delivery{}, nil
+	}
+	if len(streams) > 1 || len(streams[0].Messages) > 1 {
+		metrics.StoreErrors.WithLabelValues(queueName, "ConsumeDelivery").Inc()
+		return Delivery{}, fmt.Errorf("unexpected multiple stream messages: %d streams, %d messages",
+			len(streams), len(streams[0].Messages))
 	}
 	delivery, err := parseDelivery(streams[0].Messages[0])
 	if err != nil {

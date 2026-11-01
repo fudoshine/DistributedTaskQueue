@@ -19,7 +19,7 @@ func TestCreateJobReturnsEmptyRowOnRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parent, err := sharedRepo.CreateJob(t.Context(), "queue:test", repository.Task{
+	parent, err := sharedRepo.CreateJob(t.Context(), contract.CapabilityStream, repository.Task{
 		ExecutionContract: contract,
 		EffectKey:         uuid.New(),
 		ID:                uuid.New(), WorkflowID: workflow.ID, TaskType: "reference.echo",
@@ -29,17 +29,19 @@ func TestCreateJobReturnsEmptyRowOnRollback(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name    string
-		queue   string
-		parents []uuid.UUID
+		name             string
+		capabilityStream string
+		parents          []uuid.UUID
 	}{
-		{"dependency failure after inserting an edge", "queue:test", []uuid.UUID{parent.ID, uuid.New()}},
+		{"dependency failure after inserting an edge", contract.CapabilityStream, []uuid.UUID{parent.ID, uuid.New()}},
 		{"outbox failure", strings.Repeat("q", 256), nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
-			result, err := sharedRepo.CreateJob(t.Context(), tc.queue, repository.Task{
-				ExecutionContract: contract,
+			taskContract := contract
+			taskContract.CapabilityStream = tc.capabilityStream
+			result, err := sharedRepo.CreateJob(t.Context(), "queue:test", repository.Task{
+				ExecutionContract: taskContract,
 				EffectKey:         uuid.New(),
 				ID:                uuid.New(), WorkflowID: workflow.ID, ParentIDs: tc.parents,
 				TaskType: "reference.echo", Payload: json.RawMessage(`{"message":"hello"}`),
