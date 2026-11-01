@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,18 +27,6 @@ const (
 	outboxBatchSize   = 100
 	recoveryBatchSize = 100
 )
-
-func simulateProcessing(ctx context.Context, taskID string) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-time.After(2 * time.Second):
-	}
-	if rand.Intn(5) == 0 {
-		return errors.New("simulated processing failure")
-	}
-	return nil
-}
 
 // startLeaseHeartbeat renews the durable fence and resets Stream PEL idle time.
 // Postgres remains the authority: a Redis heartbeat failure never permits a
@@ -89,7 +76,7 @@ func acknowledge(ctx context.Context, store *redis.RedisStore, queueName string,
 	}
 }
 
-func processDelivery(ctx context.Context, queueName, consumer string, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, delivery redis.Delivery) {
+func processDelivery(ctx context.Context, catalog *execution.Catalog, queueName, consumer string, leaseTTL time.Duration, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, delivery redis.Delivery) {
 	var claim repository.JobClaim
 	var claimErr error
 	cbErr := dbBreaker.Call(func() error {
@@ -122,10 +109,46 @@ func processDelivery(ctx context.Context, queueName, consumer string, leaseTTL t
 			return
 		}
 	}
+	taskID, err := uuid.Parse(delivery.TaskID)
+	if err != nil {
+		slog.Error("invalid task ID",
+			"taskId", delivery.TaskID, "error", err)
+		return
+	}
 
+	stored, err := jobs.GetTask(ctx, taskID)
+	if err != nil {
+		slog.Warn("load claimed job",
+			"taskId", delivery.TaskID, "error", err)
+		return
+	}
+	contract := stored.ExecutionContract
+
+	if contract == nil ||
+		contract.TaskType != stored.TaskType ||
+		contract.CapabilityStream != queueName {
+
+		slog.Error("job contract does not match delivery",
+			"taskId", delivery.TaskID, "stream", queueName)
+
+		if err := store.MoveToDeadLetterQueue(ctx, queueName, delivery); err != nil {
+			slog.Error("quarantine delivery failed",
+				"taskId", delivery.TaskID, "error", err)
+			return
+		}
+
+		acknowledge(ctx, store, queueName, delivery)
+		return
+	}
 	processingCtx, stopHeartbeat := startLeaseHeartbeat(ctx, queueName, consumer, delivery, claim, leaseTTL, store, jobs)
 	started := time.Now()
-	processingErr := simulateProcessing(processingCtx, delivery.TaskID)
+	handlerCtx, cancelHandler := context.WithTimeout(
+		processingCtx, stored.ExecutionContract.HandlerTimeout,
+	)
+	_, processingErr := catalog.Execute(
+		handlerCtx, *stored.ExecutionContract, stored.Payload,
+	)
+	cancelHandler()
 	metrics.ProcessingDuration.WithLabelValues(queueName).Observe(time.Since(started).Seconds())
 	if stopHeartbeat() {
 		return
@@ -193,10 +216,10 @@ func processDelivery(ctx context.Context, queueName, consumer string, leaseTTL t
 	acknowledge(ctx, store, queueName, delivery)
 }
 
-func runWorker(ctx context.Context, routes []execution.CatalogEntry, consumer string, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
+func runWorker(ctx context.Context, catalog *execution.Catalog, routes []execution.CatalogEntry, consumer string, store *redis.RedisStore, jobs *repository.JobRepository, dbBreaker *circuitbreaker.CircuitBreaker, wg *sync.WaitGroup) {
 	defer wg.Done()
 	slog.Info("stream worker started", "consumer", consumer)
-	if routes == nil || len(routes) == 0 {
+	if len(routes) == 0 {
 		slog.Warn("no catalog routes; worker will not process any deliveries")
 		return
 	}
@@ -220,7 +243,7 @@ func runWorker(ctx context.Context, routes []execution.CatalogEntry, consumer st
 		if delivery.StreamID == "" {
 			continue
 		}
-		processDelivery(ctx, route.CapabilityStream, consumer, route.LeaseTTL, store, jobs, dbBreaker, delivery)
+		processDelivery(ctx, catalog, route.CapabilityStream, consumer, route.LeaseTTL, store, jobs, dbBreaker, delivery)
 	}
 }
 
@@ -379,7 +402,7 @@ func main() {
 	workerCount := cfg.Worker.Count
 	wg.Add(workerCount + 4)
 	for i := 0; i < workerCount; i++ {
-		go runWorker(ctx, routes, fmt.Sprintf("worker-%s-%d", uuid.NewString(), i), store, jobs, breaker, &wg)
+		go runWorker(ctx, catalog, routes, fmt.Sprintf("worker-%s-%d", uuid.NewString(), i), store, jobs, breaker, &wg)
 	}
 	go runOutboxRelay(ctx, time.Second, cfg.Queue.HoldTTL, store, jobs, &wg)
 	go runJanitor(ctx, routes, cfg.Queue.JanitorInterval, store, jobs, &wg)
