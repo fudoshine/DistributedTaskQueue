@@ -295,3 +295,77 @@ func submissionRowCounts(t *testing.T) (workflows, jobs, outbox int64) {
 	}
 	return workflows, jobs, outbox
 }
+
+func TestDraftRootAppendDoesNotPublish(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	ctx := t.Context()
+	contract, err := execution.NewCatalog()
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry, err := contract.Lookup("reference.echo")
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := service.NewTaskService(sharedRepo, contract)
+	var workflowID uuid.UUID
+	err = sharedPool.QueryRow(ctx, `INSERT INTO workflows
+			(name, status, sealed_at, draft_expires_at)
+		VALUES
+			($1, 'DRAFT', NULL, NOW() + INTERVAL '24 hours')
+		RETURNING id;`, "draft root append").Scan(&workflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err := svc.CreateTask(
+		ctx,
+		entry.CapabilityStream,
+		workflowID,
+		nil,
+		entry.TaskType,
+		json.RawMessage(`{"message":"hello"}`),
+	)
+	if err != nil {
+		t.Fatalf("create task: %v", err)
+	}
+	if task.Status != domain.TaskStatusPending {
+		t.Fatalf("draft root task status = %v, want PENDING", task.Status)
+	}
+	job, err := sharedRepo.GetTask(ctx, task.ID)
+	if err != nil {
+		t.Fatalf("get task: %v", err)
+	}
+	if job.Status != domain.TaskStatusPending {
+		t.Fatalf("draft root task status = %v, want PENDING", job.Status)
+	}
+	if job.ExecutionContract == nil || *job.ExecutionContract != entry {
+		t.Fatalf("draft root task execution contract = %v, want %v", job.ExecutionContract, entry)
+	}
+	if job.EffectKey == nil || *job.EffectKey == uuid.Nil {
+		t.Fatalf("expected nonzero effect key, got %v", job.EffectKey)
+	}
+	var outboxCount int64
+	err = sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM outbox WHERE task_id = $1`, task.ID).Scan(&outboxCount)
+	if err != nil {
+		t.Fatalf("count outbox: %v", err)
+	}
+	if outboxCount != 0 {
+		t.Fatalf("draft root task has %d outbox entries, want 0", outboxCount)
+	}
+	got, err := sharedRepo.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		t.Fatalf("get workflow ID: %v", err)
+	}
+	if got.Status != domain.WorkflowStatusDraft {
+		t.Fatalf("workflow status = %v, want DRAFT", got.Status)
+	}
+	if got.ID != workflowID {
+		t.Fatalf("workflow ID = %v, want %v", got, workflowID)
+	}
+	if got.DraftExpiresAt == nil || got.DraftExpiresAt.IsZero() {
+		t.Fatalf("workflow draft_expires_at = %v, want non-nil", got.DraftExpiresAt)
+	}
+	if got.SealedAt != nil {
+		t.Fatalf("workflow sealed_at = %v, want nil", got.SealedAt)
+	}
+}

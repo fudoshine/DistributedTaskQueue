@@ -170,8 +170,24 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
 
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));`,
+		task.WorkflowID,
+	); err != nil {
+		return JobRow{}, fmt.Errorf("failed to lock workflow: %w", err)
+	}
+
+	var workflowStatus domain.WorkflowStatus
+	err = tx.QueryRow(ctx,
+		`SELECT status FROM workflows WHERE id = $1`,
+		task.WorkflowID,
+	).Scan(&workflowStatus)
+	if err != nil {
+		return JobRow{}, fmt.Errorf("failed to read workflow: %w", err)
+	}
 	status := domain.TaskStatusPending
-	if len(task.ParentIDs) == 0 {
+	if workflowStatus != domain.WorkflowStatusDraft &&
+		len(task.ParentIDs) == 0 {
 		status = domain.TaskStatusQueued
 	}
 	var jobRow JobRow
@@ -214,11 +230,14 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 		// Root task (no parents) — write outbox row in the same transaction.
 		// The outbox relay will enqueue this to Redis. This guarantees atomicity:
 		// either both processed_jobs and outbox land, or neither does.
-		_, err = insertDelivery(ctx, tx, task.ID, task.ExecutionContract.CapabilityStream, 0, time.Now())
-		if err != nil {
-			metrics.JobRepoErrors.WithLabelValues(queueName, "CreateJob").Inc()
-			return JobRow{}, fmt.Errorf("failed to write outbox row for task %s: %w", task.ID, err)
+		if status == domain.TaskStatusQueued {
+			_, err = insertDelivery(ctx, tx, task.ID, task.ExecutionContract.CapabilityStream, 0, time.Now())
+			if err != nil {
+				metrics.JobRepoErrors.WithLabelValues(queueName, "CreateJob").Inc()
+				return JobRow{}, fmt.Errorf("failed to write outbox row for task %s: %w", task.ID, err)
+			}
 		}
+
 	}
 
 	if err := tx.Commit(ctx); err != nil {
