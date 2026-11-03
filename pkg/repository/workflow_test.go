@@ -3,6 +3,11 @@ package repository_test
 import (
 	"context"
 	"distributed-queue/internal/domain"
+	"distributed-queue/internal/execution"
+	"distributed-queue/pkg/repository"
+	"encoding/json"
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -91,23 +96,158 @@ func TestWorkflowIntegration(t *testing.T) {
 	if workflow.Name != wname {
 		t.Fatalf("Name is not matching with passed name in input passed: %v, getting %v", wname, workflow.Name)
 	}
-	if workflow.Status != domain.WorkflowStatusPending {
-		t.Fatalf("Expected status is pending but getting different %v", workflow.Status)
+	if workflow.Status != domain.WorkflowStatusDraft {
+		t.Fatalf("Expected status is Draft but getting different %v", workflow.Status)
+	}
+	if workflow.SealedAt != nil {
+		t.Fatal("Expected 'SealedAt' as null")
+	}
+	if workflow.DraftExpiresAt == nil || !workflow.DraftExpiresAt.Equal(workflow.CreatedAt.Add(24*time.Hour)) {
+		t.Fatal("Wrong Draft Expires Time or its null")
 	}
 	curWorkflow, err := sharedRepo.GetWorkflow(ctx, workflow.ID)
 	if err != nil {
 		t.Fatalf("Getting error in fetching workflow detail %v", err)
 	}
+	if curWorkflow.DraftExpiresAt == nil {
+		t.Fatal("stored draft expiry is NULL")
+	}
+	if curWorkflow.SealedAt != nil {
+		t.Fatal("draft workflow must not be sealed")
+	}
 	if workflow.ID != curWorkflow.ID ||
 		workflow.Status != curWorkflow.Status ||
 		workflow.TenantID != curWorkflow.TenantID ||
-		workflow.SealedAt != curWorkflow.SealedAt ||
-		workflow.DraftExpiresAt != curWorkflow.DraftExpiresAt ||
 		workflow.Name != curWorkflow.Name {
 		t.Fatalf("Same instance returning different  value %v : %v", workflow, curWorkflow)
 	}
 	if !workflow.CreatedAt.Equal(curWorkflow.CreatedAt) ||
-		!workflow.UpdatedAt.Equal(curWorkflow.UpdatedAt) {
+		!workflow.UpdatedAt.Equal(curWorkflow.UpdatedAt) ||
+		!workflow.DraftExpiresAt.Equal(*curWorkflow.DraftExpiresAt) {
 		t.Fatal("stored timestamps do not match")
+	}
+}
+func TestSealUnreadyRouteLeavesDraftUnchanged(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	ctx := context.Background()
+
+	revision1 := referenceContract(t)
+	revision2 := revision1
+	revision2.RouteRevision = 2
+	revision2.CapabilityStream = fmt.Sprintf("queue:%s:%s:r%d:stream", revision2.TaskType, revision2.HandlerVersion, revision2.RouteRevision)
+
+	var workflowID uuid.UUID
+	err := sharedPool.QueryRow(ctx, `
+		INSERT INTO workflows
+			(name, status, sealed_at, draft_expires_at)
+		VALUES
+			($1, 'DRAFT', NULL, NOW() + INTERVAL '24 hours')
+		RETURNING id
+	`, "seal readiness test").Scan(&workflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	parent, err := sharedRepo.CreateJob(ctx, revision1.CapabilityStream, repository.Task{
+		ID: uuid.New(), WorkflowID: workflowID, TaskType: revision1.TaskType,
+		ExecutionContract: revision1, EffectKey: uuid.New(),
+		Payload: json.RawMessage(`{"message":"parent"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	child, err := sharedRepo.CreateJob(ctx, revision2.CapabilityStream, repository.Task{
+		ID: uuid.New(), WorkflowID: workflowID, TaskType: revision2.TaskType,
+		ParentIDs:         []uuid.UUID{parent.ID},
+		ExecutionContract: revision2, EffectKey: uuid.New(),
+		Payload: json.RawMessage(`{"message":"child"}`),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	notReady := errors.New("worker unavailable")
+
+	checkReady := func(_ context.Context, entry execution.CatalogEntry) error {
+		if entry.CapabilityStream == revision2.CapabilityStream {
+			return notReady
+		}
+		return nil
+	}
+
+	if _, err := sharedRepo.SealWorkflow(ctx, workflowID, nil); err == nil {
+		t.Fatal("expected an error when readiness checker is missing")
+	}
+
+	_, err = sharedRepo.SealWorkflow(ctx, workflowID, checkReady)
+	if !errors.Is(err, notReady) {
+		t.Fatalf("seal error = %v, want %v", err, notReady)
+	}
+	gotWorkflow, err := sharedRepo.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		t.Fatal("Got error during Worflow getter")
+	}
+	if gotWorkflow.Status != domain.WorkflowStatusDraft || gotWorkflow.SealedAt != nil {
+		t.Fatal("Getting wrong status or SealtAt is not nill")
+	}
+	gotParentJob, err := sharedRepo.GetTask(ctx, parent.ID)
+	if err != nil {
+		t.Fatal("Got error during getting parent job by id")
+	}
+	gotChildJob, err := sharedRepo.GetTask(ctx, child.ID)
+	if err != nil {
+		t.Fatal("Got error during getting parent job by id")
+	}
+	if gotParentJob.Status != domain.TaskStatusPending || gotChildJob.Status != domain.TaskStatusPending {
+		t.Fatal("Tasks are not in pending status")
+	}
+
+	var count int
+	err = sharedPool.QueryRow(ctx, `
+		SELECT COUNT(*) FROM outbox
+		WHERE task_id IN ($1, $2)
+	`, parent.ID, child.ID).Scan(&count)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatalf("outbox entries = %d, want 0", count)
+	}
+
+}
+
+func TestSealEmptyWorkflowLeavesDraftUnchanged(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	ctx := context.Background()
+
+	revision1 := referenceContract(t)
+	revision2 := revision1
+	revision2.RouteRevision = 2
+	revision2.CapabilityStream = fmt.Sprintf("queue:%s:%s:r%d:stream", revision2.TaskType, revision2.HandlerVersion, revision2.RouteRevision)
+
+	var workflowID uuid.UUID
+	err := sharedPool.QueryRow(ctx, `
+		INSERT INTO workflows
+			(name, status, sealed_at, draft_expires_at)
+		VALUES
+			($1, 'DRAFT', NULL, NOW() + INTERVAL '24 hours')
+		RETURNING id
+	`, "seal readiness test").Scan(&workflowID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkReady := func(context.Context, execution.CatalogEntry) error {
+		t.Fatal("readiness must not be checked for an empty workflow")
+		return nil
+	}
+	_, err = sharedRepo.SealWorkflow(ctx, workflowID, checkReady)
+	if !errors.Is(err, repository.ErrEmptyWorkflow) {
+		t.Fatalf("seal error = %v, want ErrEmptyWorkflow", err)
+	}
+	got, err := sharedRepo.GetWorkflow(ctx, workflowID)
+	if err != nil {
+		t.Fatal("Got error in fetching workflow data")
+	}
+	if got.Status != domain.WorkflowStatusDraft || got.SealedAt != nil {
+		t.Fatal("Either status is not in draft or SealAt is not nil")
 	}
 }

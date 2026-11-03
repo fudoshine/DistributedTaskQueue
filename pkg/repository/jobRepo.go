@@ -25,6 +25,7 @@ var (
 	ErrStaleDelivery   = errors.New("job execution skipped: delivery is no longer current")
 	ErrRelayLeaseLost  = errors.New("outbox relay no longer owns this delivery")
 	ErrRouteMismatch   = errors.New("job route does not match delivery stream")
+	ErrEmptyWorkflow   = errors.New("workflow has no tasks")
 
 	// ErrJobNotFound means TryStartJob was called for a taskID with no
 	// corresponding processed_jobs row. Under this system's design that
@@ -504,6 +505,87 @@ func (r *JobRepository) RecoverExpiredJob(ctx context.Context, queueName, taskID
 		return RecoveryKeepInflight, nil
 	}
 	return RecoveryAcknowledge, nil
+}
+
+func (r *JobRepository) SealWorkflow(ctx context.Context, workflowID uuid.UUID, checkReady func(context.Context, execution.CatalogEntry) error,
+) (bool, error) {
+	if checkReady == nil {
+		return false, errors.New("readiness checker is required")
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return false, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
+	if _, err := tx.Exec(ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));`,
+		workflowID,
+	); err != nil {
+		return false, fmt.Errorf("failed to lock workflow: %w", err)
+	}
+	var status domain.WorkflowStatus
+	var draftExpiresAt *time.Time
+	var sealedAt *time.Time
+	var dbNow time.Time
+	err = tx.QueryRow(ctx, `
+		SELECT status, draft_expires_at, sealed_at, clock_timestamp()
+		FROM workflows
+		WHERE id = $1
+	`, workflowID).Scan(&status, &draftExpiresAt, &sealedAt, &dbNow)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("workflow %s not found", workflowID)
+	}
+	if err != nil {
+		return false, fmt.Errorf("failed to query workflow: %w", err)
+	}
+	if status != domain.WorkflowStatusDraft {
+		return false, fmt.Errorf("workflow %s is not in draft status", workflowID)
+	}
+	if draftExpiresAt == nil || !draftExpiresAt.After(dbNow) {
+		return false, fmt.Errorf(
+			"workflow %s draft has expired or has no expiry",
+			workflowID,
+		)
+	}
+	if sealedAt != nil {
+		return false, fmt.Errorf("workflow %s is already sealed", workflowID)
+	}
+	rows, err := tx.Query(ctx, `SELECT execution_contract FROM processed_jobs WHERE workflow_id=$1`, workflowID)
+	if err != nil {
+		return false, fmt.Errorf("failed to query jobs for workflow %s: %w", workflowID, err)
+	}
+	defer rows.Close()
+	hasJobs := false
+	for rows.Next() {
+		hasJobs = true
+		var contractJSON []byte
+		if err := rows.Scan(&contractJSON); err != nil {
+			return false, fmt.Errorf("failed to scan contract: %w", err)
+		}
+
+		var entry execution.CatalogEntry
+		if err := json.Unmarshal(contractJSON, &entry); err != nil {
+			return false, fmt.Errorf("failed to decode contract: %w", err)
+		}
+
+		if err := checkReady(ctx, entry); err != nil {
+			return false, fmt.Errorf(
+				"route %q is not ready: %w",
+				entry.CapabilityStream,
+				err,
+			)
+		}
+	}
+
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("failed to iterate contracts: %w", err)
+	}
+
+	if !hasJobs {
+		return false, ErrEmptyWorkflow
+	}
+
+	return false, errors.New("seal activation is not implemented yet")
 }
 
 // CompleteJobAndScheduleChildren durably completes a job and promotes every
