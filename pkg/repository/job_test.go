@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
-	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -110,25 +109,15 @@ func TestCreateJobWithNullWorkflowExpiry(t *testing.T) {
 				ID: taskID, WorkflowID: workflowID, TaskType: contract.TaskType,
 				ExecutionContract: contract, EffectKey: uuid.New(),
 			})
-			if status == domain.WorkflowStatusPending {
-				if err != nil {
-					t.Fatalf("PENDING workflow with NULL expiry rejected: %v", err)
-				}
-				if job.ID != taskID || job.Status != domain.TaskStatusQueued {
-					t.Errorf("expected queued job %s, got %+v", taskID, job)
-				}
-				beforeJobs++
-				beforeOutbox++
-			} else {
-				if err == nil {
-					t.Errorf("expected %s workflow with NULL expiry to reject job creation", status)
-				}
-				if status == domain.WorkflowStatusDraft && !errors.Is(err, repository.ErrDraftExpired) {
-					t.Errorf("expected ErrDraftExpired, got %v", err)
-				}
-				if !reflect.DeepEqual(job, repository.JobRow{}) {
-					t.Errorf("rejected workflow returned a job: %+v", job)
-				}
+			wantErr := repository.ErrWorkflowNotDraft
+			if status == domain.WorkflowStatusDraft {
+				wantErr = repository.ErrDraftExpired
+			}
+			if !errors.Is(err, wantErr) {
+				t.Errorf("expected %s workflow with NULL expiry to return %v, got %v", status, wantErr, err)
+			}
+			if !reflect.DeepEqual(job, repository.JobRow{}) {
+				t.Errorf("rejected workflow returned a job: %+v", job)
 			}
 			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
 			if afterJobs != beforeJobs || afterOutbox != beforeOutbox {
@@ -162,36 +151,23 @@ func TestCreateJobReturnsEmptyRowOnRollback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, tc := range []struct {
-		name             string
-		capabilityStream string
-		parents          []uuid.UUID
-	}{
-		{"dependency failure after inserting an edge", contract.CapabilityStream, []uuid.UUID{parent.ID, uuid.New()}},
-		{"outbox failure", strings.Repeat("q", 256), nil},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
-			taskContract := contract
-			taskContract.CapabilityStream = tc.capabilityStream
-			result, err := sharedRepo.CreateJob(t.Context(), "queue:test", repository.Task{
-				ExecutionContract: taskContract,
-				EffectKey:         uuid.New(),
-				ID:                uuid.New(), WorkflowID: workflow.ID, ParentIDs: tc.parents,
-				TaskType: "reference.echo", Payload: json.RawMessage(`{"message":"hello"}`),
-			})
-			if err == nil {
-				t.Fatal("expected job creation to fail")
-			}
-			if !reflect.DeepEqual(result, repository.JobRow{}) {
-				t.Fatalf("failed transaction returned a job: %+v", result)
-			}
-			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
-			if afterJobs != beforeJobs || afterOutbox != beforeOutbox {
-				t.Fatalf("failed creation changed job/outbox counts: %d/%d -> %d/%d",
-					beforeJobs, beforeOutbox, afterJobs, afterOutbox)
-			}
-		})
+	beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
+	result, err := sharedRepo.CreateJob(t.Context(), "queue:test", repository.Task{
+		ExecutionContract: contract,
+		EffectKey:         uuid.New(),
+		ID:                uuid.New(), WorkflowID: workflow.ID, ParentIDs: []uuid.UUID{parent.ID, uuid.New()},
+		TaskType: "reference.echo", Payload: json.RawMessage(`{"message":"hello"}`),
+	})
+	if !errors.Is(err, repository.ErrInvalidParents) {
+		t.Fatalf("expected missing parent rejection, got %v", err)
+	}
+	if !reflect.DeepEqual(result, repository.JobRow{}) {
+		t.Fatalf("failed transaction returned a job: %+v", result)
+	}
+	afterJobs, afterOutbox := taskSubmissionRowCounts(t)
+	if afterJobs != beforeJobs || afterOutbox != beforeOutbox {
+		t.Fatalf("failed creation changed job/outbox counts: %d/%d -> %d/%d",
+			beforeJobs, beforeOutbox, afterJobs, afterOutbox)
 	}
 }
 

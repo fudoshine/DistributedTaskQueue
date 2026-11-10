@@ -97,7 +97,16 @@ func referenceContract(tb testing.TB) execution.CatalogEntry {
 	return entry
 }
 
-// getDeliveryID reads back the outbox delivery_id written by CreateJob.
+func sealWorkflow(tb testing.TB, workflowID uuid.UUID) {
+	tb.Helper()
+	if _, err := sharedRepo.SealWorkflow(tb.Context(), workflowID, func(context.Context, execution.CatalogEntry) error {
+		return nil
+	}); err != nil {
+		tb.Fatalf("seal workflow %s: %v", workflowID, err)
+	}
+}
+
+// getDeliveryID reads back a task's initial outbox delivery_id.
 // In production this flows: outbox → relay → Redis message → worker.
 // In tests we read it directly to simulate what the worker receives.
 func getDeliveryID(ctx context.Context, taskID uuid.UUID) (uuid.UUID, error) {
@@ -124,9 +133,8 @@ func BenchmarkCreateWorkflow(b *testing.B) {
 	}
 }
 
-// BenchmarkCreateJob measures task creation throughput (serial).
-// Includes the full transactional outbox write — this is the honest API cost.
-func BenchmarkCreateJob(b *testing.B) {
+// BenchmarkCreateJobDraftAppend measures draft task append throughput (serial).
+func BenchmarkCreateJobDraftAppend(b *testing.B) {
 	RequireRepositoryIntegration(b)
 	contract := referenceContract(b)
 	ctx := context.Background()
@@ -174,11 +182,15 @@ func BenchmarkTryStartJob(b *testing.B) {
 		}); err != nil {
 			b.Fatalf("create job: %v", err)
 		}
-		deliveryID, err := getDeliveryID(ctx, taskID)
+		entries[i].taskID = taskID
+	}
+	sealWorkflow(b, workflowID)
+	for i := range entries {
+		deliveryID, err := getDeliveryID(ctx, entries[i].taskID)
 		if err != nil {
 			b.Fatalf("get delivery id: %v", err)
 		}
-		entries[i] = entry{taskID, deliveryID}
+		entries[i].deliveryID = deliveryID
 	}
 
 	b.ResetTimer()
@@ -228,6 +240,7 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 			}
 			prevID = childID
 		}
+		sealWorkflow(b, workflowID)
 		b.StartTimer()
 		if err := sharedRepo.MarkAsCancelledCascading(ctx, "queue:bench", rootID.String()); err != nil {
 			b.Fatalf("cascade cancel: %v", err)
@@ -237,9 +250,9 @@ func BenchmarkCascadingCancellation(b *testing.B) {
 
 // ── Parallel benchmarks ──────────────────────────────────────────────────────
 
-// BenchmarkCreateJobParallel measures task creation under concurrent load.
+// BenchmarkCreateJobDraftAppendParallel measures draft task appends under concurrent load.
 // Uses b.RunParallel with GOMAXPROCS goroutines sharing the connection pool.
-func BenchmarkCreateJobParallel(b *testing.B) {
+func BenchmarkCreateJobDraftAppendParallel(b *testing.B) {
 	RequireRepositoryIntegration(b)
 	contract := referenceContract(b)
 	ctx := context.Background()
@@ -289,11 +302,15 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 		}); err != nil {
 			b.Fatalf("create job: %v", err)
 		}
-		deliveryID, err := getDeliveryID(ctx, taskID)
+		entries[i].taskID = taskID
+	}
+	sealWorkflow(b, workflowID)
+	for i := range entries {
+		deliveryID, err := getDeliveryID(ctx, entries[i].taskID)
 		if err != nil {
 			b.Fatalf("get delivery id: %v", err)
 		}
-		entries[i] = entry{taskID, deliveryID}
+		entries[i].deliveryID = deliveryID
 	}
 
 	var idx atomic.Int64
@@ -320,8 +337,8 @@ func BenchmarkTryStartJobParallel(b *testing.B) {
 
 // ── Latency test ─────────────────────────────────────────────────────────────
 
-// TestEndToEndLatency measures p50/p95/p99 latency for the full creation path:
-// CreateWorkflow + CreateJob (includes transactional outbox write).
+// TestEndToEndLatency measures p50/p95/p99 latency for a full submission:
+// CreateWorkflow + CreateJob + SealWorkflow, including transactional outbox publication.
 // Includes a warmup phase to avoid cold-start skew.
 func TestEndToEndLatency(t *testing.T) {
 	RequireRepositoryIntegration(t)
@@ -335,14 +352,19 @@ func TestEndToEndLatency(t *testing.T) {
 
 	// warmup — not measured
 	for i := 0; i < warmup; i++ {
-		workflow, _ := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("warmup-%d", i))
-		wid := workflow.ID
-		_, _ = sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
+		workflow, err := sharedRepo.CreateWorkflow(ctx, fmt.Sprintf("warmup-%d", i))
+		if err != nil {
+			t.Fatalf("create workflow: %v", err)
+		}
+		if _, err := sharedRepo.CreateJob(ctx, "queue:bench", repository.Task{
 			ExecutionContract: contract,
 			EffectKey:         uuid.New(),
-			ID:                uuid.New(), WorkflowID: wid,
+			ID:                uuid.New(), WorkflowID: workflow.ID,
 			TaskType: contract.TaskType, Payload: json.RawMessage(`{"message":"benchmark"}`),
-		})
+		}); err != nil {
+			t.Fatalf("create job: %v", err)
+		}
+		sealWorkflow(t, workflow.ID)
 	}
 
 	durations := make([]time.Duration, runs)
@@ -362,6 +384,7 @@ func TestEndToEndLatency(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("create job: %v", err)
 		}
+		sealWorkflow(t, workflow.ID)
 		durations[i] = time.Since(start)
 	}
 
@@ -374,7 +397,7 @@ func TestEndToEndLatency(t *testing.T) {
 	sort.Slice(durations, func(i, j int) bool { return durations[i] < durations[j] })
 
 	t.Logf("Environment: Apple M3 Pro, local Docker Postgres 14, synchronous_commit=on, pool=20")
-	t.Logf("CreateWorkflow+CreateJob latency over %d runs (after %d warmup):", runs, warmup)
+	t.Logf("CreateWorkflow+CreateJob+SealWorkflow latency over %d runs (after %d warmup):", runs, warmup)
 	t.Logf("  avg: %v", avg)
 	t.Logf("  p50: %v", durations[runs*50/100])
 	t.Logf("  p95: %v", durations[runs*95/100])
@@ -400,6 +423,7 @@ func TestRecoverIdleDeliveryRespectsDatabaseLease(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("create job: %v", err)
 	}
+	sealWorkflow(t, workflowID)
 	deliveryID, err := getDeliveryID(ctx, taskID)
 	if err != nil {
 		t.Fatalf("get delivery ID: %v", err)

@@ -608,6 +608,101 @@ func TestSealWorkflowConcurrentSealsPublishOnce(t *testing.T) {
 	assertWorkflowSealPublications(t, workflowID, roots...)
 }
 
+func TestSealWorkflowConcurrentAppend(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	contract := referenceContract(t)
+	candidateContract := contract
+	candidateContract.MaxJobAge *= 2
+	var appendFirst, sealFirst int
+	for i := range 20 {
+		t.Run(fmt.Sprintf("race_%d", i), func(t *testing.T) {
+			workflowID, roots := seedWorkflowSealDraft(t, contract)
+			ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+			defer cancel()
+			candidateID := uuid.New()
+			type appendResult struct {
+				job repository.JobRow
+				err error
+			}
+			start := make(chan struct{})
+			appendResults := make(chan appendResult, 1)
+			sealErrors := make(chan error, 1)
+			go func() {
+				<-start
+				job, err := sharedRepo.CreateJob(ctx, candidateContract.CapabilityStream, repository.Task{
+					ID: candidateID, WorkflowID: workflowID, TaskType: candidateContract.TaskType,
+					ExecutionContract: candidateContract, EffectKey: uuid.New(),
+					Payload: json.RawMessage(`{"message":"racing root"}`),
+				})
+				appendResults <- appendResult{job, err}
+			}()
+			go func() {
+				<-start
+				_, err := sharedRepo.SealWorkflow(ctx, workflowID, func(context.Context, execution.CatalogEntry) error { return nil })
+				sealErrors <- err
+			}()
+			close(start)
+			var appended appendResult
+			select {
+			case appended = <-appendResults:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			var sealErr error
+			select {
+			case sealErr = <-sealErrors:
+			case <-ctx.Done():
+				t.Fatal(ctx.Err())
+			}
+			if sealErr != nil {
+				t.Fatalf("concurrent seal: %v", sealErr)
+			}
+			switch {
+			case appended.err == nil:
+				appendFirst++
+				if appended.job.ID != candidateID || appended.job.Status != domain.TaskStatusPending {
+					t.Fatalf("successful draft append returned %+v", appended.job)
+				}
+				roots = append(roots, appended.job)
+			case errors.Is(appended.err, repository.ErrWorkflowSealed):
+				sealFirst++
+				if !reflect.DeepEqual(appended.job, repository.JobRow{}) {
+					t.Fatalf("rejected append returned a job: %+v", appended.job)
+				}
+			default:
+				t.Fatalf("concurrent append: %v", appended.err)
+			}
+			stored, err := sharedRepo.GetWorkflow(ctx, workflowID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stored.Status != domain.WorkflowStatusPending || stored.SealedAt == nil {
+				t.Fatalf("concurrent seal left workflow %+v", stored)
+			}
+			var jobCount int
+			if err := sharedPool.QueryRow(ctx, `SELECT COUNT(*) FROM processed_jobs WHERE workflow_id = $1`, workflowID).Scan(&jobCount); err != nil {
+				t.Fatal(err)
+			}
+			if jobCount != len(roots) {
+				t.Fatalf("persisted jobs = %d, want %d", jobCount, len(roots))
+			}
+			for _, root := range roots {
+				var status domain.TaskStatus
+				var deadline *time.Time
+				if err := sharedPool.QueryRow(ctx, `SELECT status, job_deadline_at FROM processed_jobs WHERE id = $1 AND workflow_id = $2`, root.ID, workflowID).Scan(&status, &deadline); err != nil {
+					t.Fatal(err)
+				}
+				wantDeadline := stored.SealedAt.Add(root.ExecutionContract.MaxJobAge)
+				if status != domain.TaskStatusQueued || deadline == nil || !deadline.Equal(wantDeadline) {
+					t.Fatalf("root %s: status = %s, deadline = %v; want QUEUED, %v", root.ID, status, deadline, wantDeadline)
+				}
+			}
+			assertWorkflowSealPublications(t, workflowID, roots...)
+		})
+	}
+	t.Logf("serialized outcomes: append first=%d, seal first=%d", appendFirst, sealFirst)
+}
+
 func seedWorkflowSealDraft(t *testing.T, contracts ...execution.CatalogEntry) (uuid.UUID, []repository.JobRow) {
 	t.Helper()
 	var workflowID uuid.UUID

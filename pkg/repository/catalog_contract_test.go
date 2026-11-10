@@ -62,7 +62,9 @@ func TestCreateJobPinsExecutionContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	var firstID, firstEffectKey uuid.UUID
-	for i, contract := range []execution.CatalogEntry{original, revised} {
+	contracts := []execution.CatalogEntry{original, revised}
+	jobIDs := make([]uuid.UUID, len(contracts))
+	for i, contract := range contracts {
 		effectKey := uuid.New()
 		result, err := sharedRepo.CreateJob(t.Context(), "queue:test", repository.Task{
 			ID: uuid.New(), WorkflowID: workflow.ID, TaskType: contract.TaskType,
@@ -72,6 +74,7 @@ func TestCreateJobPinsExecutionContract(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		jobIDs[i] = result.ID
 		stored, err := sharedRepo.GetTask(t.Context(), result.ID)
 		if err != nil {
 			t.Fatal(err)
@@ -95,17 +98,20 @@ func TestCreateJobPinsExecutionContract(t *testing.T) {
 				t.Fatalf("payload mismatch: got %v, want %v", actual, expected)
 			}
 		}
+		if i == 0 {
+			firstID, firstEffectKey = result.ID, effectKey
+		}
+	}
+	sealWorkflow(t, workflow.ID)
+	for i, contract := range contracts {
 		var queueName string
-		err = sharedPool.QueryRow(t.Context(), `SELECT queue_name FROM outbox WHERE task_id=$1 AND generation=0`, result.ID).Scan(&queueName)
+		err = sharedPool.QueryRow(t.Context(), `SELECT queue_name FROM outbox WHERE task_id=$1 AND generation=0`, jobIDs[i]).Scan(&queueName)
 		if err != nil {
 			t.Fatalf("check recovery outbox: %v", err)
 		}
 		if queueName != contract.CapabilityStream {
 			t.Fatalf("root outbox queue = %q, want saved stream %q",
 				queueName, contract.CapabilityStream)
-		}
-		if i == 0 {
-			firstID, firstEffectKey = result.ID, effectKey
 		}
 	}
 	first, err := sharedRepo.GetTask(t.Context(), firstID)
@@ -137,6 +143,7 @@ func TestSingleAttemptContractFailsWithoutRetry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sealWorkflow(t, workflow.ID)
 	deliveryID, err := getDeliveryID(t.Context(), job.ID)
 	if err != nil {
 		t.Fatal(err)

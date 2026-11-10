@@ -23,7 +23,7 @@ func bindStrictJSON(c *gin.Context, dst any) error {
 	var extra any
 	if err := decoder.Decode(&extra); err != io.EOF {
 		if err == nil {
-			return fmt.Errorf("Request must contain exactly one JSON value")
+			return fmt.Errorf("request must contain exactly one JSON value")
 		}
 		return fmt.Errorf("unexpected data after json value: %w", err)
 	}

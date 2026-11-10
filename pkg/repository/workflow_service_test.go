@@ -4,6 +4,7 @@ import (
 	"distributed-queue/internal/api"
 	v1 "distributed-queue/internal/api/handlers/v1"
 	"distributed-queue/internal/api/service"
+	"distributed-queue/internal/domain"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -66,9 +67,11 @@ func TestWorkflowHandlerCreateWorkflow(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
-				if result.ID != stored.ID || result.Name != stored.Name || result.Status != stored.Status ||
+				if result.ID != stored.ID || result.Name != stored.Name ||
+					result.Status != domain.WorkflowStatusDraft || result.Status != stored.Status ||
 					result.SealedAt != nil || stored.SealedAt != nil ||
-					result.DraftExpiresAt != nil || stored.DraftExpiresAt != nil ||
+					result.DraftExpiresAt == nil || stored.DraftExpiresAt == nil ||
+					!result.DraftExpiresAt.Equal(*stored.DraftExpiresAt) ||
 					!result.CreatedAt.Equal(stored.CreatedAt) || !result.UpdatedAt.Equal(stored.UpdatedAt) {
 					t.Fatalf("response differs from persisted workflow: response=%+v stored=%+v", result, stored)
 				}

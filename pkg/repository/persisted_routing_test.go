@@ -42,6 +42,7 @@ func TestPersistedJobRouting(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	sealWorkflow(t, workflow.ID)
 	deliveryID, err := getDeliveryID(ctx, parent.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -85,6 +86,7 @@ func TestRetryUsesPersistedRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sealWorkflow(t, workflow.ID)
 	deliveryID, err := getDeliveryID(ctx, job.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -142,6 +144,7 @@ func TestExpiredLeaseRecoveryUsesPersistedRoutes(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sealWorkflow(t, workflow.ID)
 	deliveryID1, err := getDeliveryID(ctx, job1.ID)
 	if err != nil {
 		t.Fatal(err)
@@ -212,6 +215,7 @@ func TestTryStartRejectsWrongRoute(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sealWorkflow(t, workflow.ID)
 	deliveryID, err := getDeliveryID(ctx, job.ID)
 	if err != nil {
 		t.Fatal(err)

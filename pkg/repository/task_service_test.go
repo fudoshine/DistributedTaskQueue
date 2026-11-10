@@ -79,12 +79,15 @@ func TestTaskServiceCreateTask(t *testing.T) {
 					t.Fatalf("unexpected stored task: %+v", stored)
 				}
 				assertTaskResponseMatchesStored(t, result, stored)
+				if result.Status != domain.TaskStatusPending {
+					t.Fatalf("task status = %s, want PENDING", result.Status)
+				}
 				added = 1
 			}
 			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
-			if afterJobs != beforeJobs+added || afterOutbox != beforeOutbox+added {
-				t.Fatalf("job/outbox counts changed from %d/%d to %d/%d; expected delta %d/%d",
-					beforeJobs, beforeOutbox, afterJobs, afterOutbox, added, added)
+			if afterJobs != beforeJobs+added || afterOutbox != beforeOutbox {
+				t.Fatalf("job/outbox counts changed from %d/%d to %d/%d; expected delta %d/0",
+					beforeJobs, beforeOutbox, afterJobs, afterOutbox, added)
 			}
 		})
 	}
@@ -181,16 +184,14 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 					t.Fatalf("unexpected stored task: %+v", stored)
 				}
 				assertTaskResponseMatchesStored(t, result, stored)
+				if result.Status != domain.TaskStatusPending {
+					t.Fatalf("task status = %s, want PENDING", result.Status)
+				}
 				if result.MaxRetries != contract.MaxAttempts {
 					t.Fatalf("retry budget = %d, want catalog budget %d", result.MaxRetries, contract.MaxAttempts)
 				}
-				var storedQueue string
-				if err := sharedPool.QueryRow(t.Context(),
-					`SELECT queue_name FROM outbox WHERE task_id = $1 AND generation = 0`, result.ID).Scan(&storedQueue); err != nil {
-					t.Fatal(err)
-				}
-				if storedQueue != contract.CapabilityStream {
-					t.Fatalf("outbox queue = %q, want catalog stream %q", storedQueue, contract.CapabilityStream)
+				if stored.ExecutionContract == nil || stored.ExecutionContract.CapabilityStream != contract.CapabilityStream {
+					t.Fatalf("persisted execution contract = %+v, want catalog stream %q", stored.ExecutionContract, contract.CapabilityStream)
 				}
 				added = 1
 			} else {
@@ -200,9 +201,9 @@ func TestTaskHandlerCreateTask(t *testing.T) {
 				}
 			}
 			afterWorkflows, afterJobs, afterOutbox := submissionRowCounts(t)
-			if afterWorkflows != beforeWorkflows || afterJobs != beforeJobs+added || afterOutbox != beforeOutbox+added {
-				t.Fatalf("workflow/job/outbox counts changed from %d/%d/%d to %d/%d/%d; expected delta 0/%d/%d",
-					beforeWorkflows, beforeJobs, beforeOutbox, afterWorkflows, afterJobs, afterOutbox, added, added)
+			if afterWorkflows != beforeWorkflows || afterJobs != beforeJobs+added || afterOutbox != beforeOutbox {
+				t.Fatalf("workflow/job/outbox counts changed from %d/%d/%d to %d/%d/%d; expected delta 0/%d/0",
+					beforeWorkflows, beforeJobs, beforeOutbox, afterWorkflows, afterJobs, afterOutbox, added)
 			}
 		})
 	}
@@ -229,7 +230,7 @@ func TestTaskCreationReturnsPersistedState(t *testing.T) {
 		dependent  bool
 		wantStatus domain.TaskStatus
 	}{
-		{"root uses catalog budget", false, domain.TaskStatusQueued},
+		{"root uses catalog budget", false, domain.TaskStatusPending},
 		{"child uses catalog budget", true, domain.TaskStatusPending},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -255,11 +256,7 @@ func TestTaskCreationReturnsPersistedState(t *testing.T) {
 				parentID = result.ID
 			}
 			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
-			wantOutbox := beforeOutbox
-			if !tc.dependent {
-				wantOutbox++
-			}
-			if afterJobs != beforeJobs+1 || afterOutbox != wantOutbox {
+			if afterJobs != beforeJobs+1 || afterOutbox != beforeOutbox {
 				t.Fatalf("unexpected job/outbox counts: %d/%d", afterJobs, afterOutbox)
 			}
 		})
