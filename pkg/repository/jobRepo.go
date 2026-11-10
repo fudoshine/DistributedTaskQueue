@@ -17,16 +17,21 @@ import (
 )
 
 var (
-	ErrDuplicateJob    = errors.New("job execution skipped: already completed")
-	ErrJobAlreadyOwned = errors.New("job execution skipped: another worker owns this job")
-	ErrJobNotReady     = errors.New("job execution skipped: not queued or dependencies are incomplete")
-	ErrTerminalJob     = errors.New("job execution skipped: job is terminal")
-	ErrLeaseLost       = errors.New("job execution skipped: lease is no longer owned by this attempt")
-	ErrStaleDelivery   = errors.New("job execution skipped: delivery is no longer current")
-	ErrRelayLeaseLost  = errors.New("outbox relay no longer owns this delivery")
-	ErrRouteMismatch   = errors.New("job route does not match delivery stream")
-	ErrEmptyWorkflow   = errors.New("workflow has no tasks")
-
+	ErrDuplicateJob                    = errors.New("job execution skipped: already completed")
+	ErrJobAlreadyOwned                 = errors.New("job execution skipped: another worker owns this job")
+	ErrJobNotReady                     = errors.New("job execution skipped: not queued or dependencies are incomplete")
+	ErrTerminalJob                     = errors.New("job execution skipped: job is terminal")
+	ErrLeaseLost                       = errors.New("job execution skipped: lease is no longer owned by this attempt")
+	ErrStaleDelivery                   = errors.New("job execution skipped: delivery is no longer current")
+	ErrRelayLeaseLost                  = errors.New("outbox relay no longer owns this delivery")
+	ErrRouteMismatch                   = errors.New("job route does not match delivery stream")
+	ErrEmptyWorkflow                   = errors.New("workflow has no tasks")
+	ErrWorkflowSealed                  = errors.New("workflow is already sealed")
+	ErrWorkflowNotDraft                = errors.New("workflow is not a draft")
+	ErrDraftExpired                    = errors.New("workflow draft has expired")
+	ErrInvalidExecutionContract        = errors.New("invalid saved execution contract")
+	ErrInvalidParents                  = errors.New("invalid task parents")
+	ErrWorkflowNotFoundOrAlreadySealed = errors.New("workflow not found or already sealed")
 	// ErrJobNotFound means TryStartJob was called for a taskID with no
 	// corresponding processed_jobs row. Under this system's design that
 	// should never happen — every task is created in Postgres via CreateJob
@@ -179,17 +184,41 @@ func (r *JobRepository) CreateJob(ctx context.Context, queueName string, task Ta
 	}
 
 	var workflowStatus domain.WorkflowStatus
+	var sealedAt, draftExpiresAt *time.Time
+	var dbNow time.Time
 	err = tx.QueryRow(ctx,
-		`SELECT status FROM workflows WHERE id = $1`,
+		`SELECT status,sealed_at,draft_expires_at,clock_timestamp() FROM workflows WHERE id = $1`,
 		task.WorkflowID,
-	).Scan(&workflowStatus)
+	).Scan(&workflowStatus, &sealedAt, &draftExpiresAt, &dbNow)
 	if err != nil {
 		return JobRow{}, fmt.Errorf("failed to read workflow: %w", err)
+	}
+	if sealedAt != nil {
+		return JobRow{}, ErrWorkflowSealed
+	}
+	if workflowStatus == domain.WorkflowStatusDraft {
+		if draftExpiresAt == nil || !draftExpiresAt.After(dbNow) {
+			return JobRow{}, ErrDraftExpired
+		}
+	} else if workflowStatus != domain.WorkflowStatusPending || draftExpiresAt != nil {
+		return JobRow{}, ErrWorkflowNotDraft
 	}
 	status := domain.TaskStatusPending
 	if workflowStatus != domain.WorkflowStatusDraft &&
 		len(task.ParentIDs) == 0 {
 		status = domain.TaskStatusQueued
+	}
+	if len(task.ParentIDs) > 0 {
+		var parentCount int
+		if err := tx.QueryRow(ctx, `
+			SELECT COUNT(*) FROM processed_jobs
+			WHERE workflow_id = $1 AND id = ANY($2::uuid[]) AND id <> $3
+		`, task.WorkflowID, task.ParentIDs, task.ID).Scan(&parentCount); err != nil {
+			return JobRow{}, fmt.Errorf("failed to validate task parents: %w", err)
+		}
+		if parentCount != len(task.ParentIDs) {
+			return JobRow{}, ErrInvalidParents
+		}
 	}
 	var jobRow JobRow
 	// Insert the job
@@ -508,20 +537,20 @@ func (r *JobRepository) RecoverExpiredJob(ctx context.Context, queueName, taskID
 }
 
 func (r *JobRepository) SealWorkflow(ctx context.Context, workflowID uuid.UUID, checkReady func(context.Context, execution.CatalogEntry) error,
-) (bool, error) {
+) (Workflow, error) {
 	if checkReady == nil {
-		return false, errors.New("readiness checker is required")
+		return Workflow{}, errors.New("readiness checker is required")
 	}
 	tx, err := r.pool.Begin(ctx)
 	if err != nil {
-		return false, fmt.Errorf("failed to begin transaction: %w", err)
+		return Workflow{}, fmt.Errorf("failed to begin transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // Rollback is a no-op after commit.
 	if _, err := tx.Exec(ctx,
 		`SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0));`,
 		workflowID,
 	); err != nil {
-		return false, fmt.Errorf("failed to lock workflow: %w", err)
+		return Workflow{}, fmt.Errorf("failed to lock workflow: %w", err)
 	}
 	var status domain.WorkflowStatus
 	var draftExpiresAt *time.Time
@@ -533,59 +562,165 @@ func (r *JobRepository) SealWorkflow(ctx context.Context, workflowID uuid.UUID, 
 		WHERE id = $1
 	`, workflowID).Scan(&status, &draftExpiresAt, &sealedAt, &dbNow)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return false, fmt.Errorf("workflow %s not found", workflowID)
+		return Workflow{}, fmt.Errorf("workflow %s not found: %w", workflowID, err)
 	}
 	if err != nil {
-		return false, fmt.Errorf("failed to query workflow: %w", err)
-	}
-	if status != domain.WorkflowStatusDraft {
-		return false, fmt.Errorf("workflow %s is not in draft status", workflowID)
-	}
-	if draftExpiresAt == nil || !draftExpiresAt.After(dbNow) {
-		return false, fmt.Errorf(
-			"workflow %s draft has expired or has no expiry",
-			workflowID,
-		)
+		return Workflow{}, fmt.Errorf("failed to query workflow: %w", err)
 	}
 	if sealedAt != nil {
-		return false, fmt.Errorf("workflow %s is already sealed", workflowID)
+		return Workflow{}, ErrWorkflowSealed
 	}
-	rows, err := tx.Query(ctx, `SELECT execution_contract FROM processed_jobs WHERE workflow_id=$1`, workflowID)
+	if status != domain.WorkflowStatusDraft {
+		return Workflow{}, ErrWorkflowNotDraft
+	}
+	if draftExpiresAt == nil || !draftExpiresAt.After(dbNow) {
+		return Workflow{}, ErrDraftExpired
+	}
+
+	rows, err := tx.Query(ctx, `SELECT execution_contract,ID,task_type,effect_key,status FROM processed_jobs WHERE workflow_id=$1`, workflowID)
 	if err != nil {
-		return false, fmt.Errorf("failed to query jobs for workflow %s: %w", workflowID, err)
+		return Workflow{}, fmt.Errorf("failed to query jobs for workflow %s: %w", workflowID, err)
 	}
 	defer rows.Close()
-	hasJobs := false
+	jobs := []JobRow{}
 	for rows.Next() {
-		hasJobs = true
 		var contractJSON []byte
-		if err := rows.Scan(&contractJSON); err != nil {
-			return false, fmt.Errorf("failed to scan contract: %w", err)
+		var id uuid.UUID
+		var taskType string
+		var effectKey uuid.UUID
+		var status domain.TaskStatus
+		if err := rows.Scan(&contractJSON, &id, &taskType, &effectKey, &status); err != nil {
+			return Workflow{}, fmt.Errorf("failed to scan contract: %w", err)
 		}
 
 		var entry execution.CatalogEntry
 		if err := json.Unmarshal(contractJSON, &entry); err != nil {
-			return false, fmt.Errorf("failed to decode contract: %w", err)
+			return Workflow{}, fmt.Errorf("failed to decode contract: %w", err)
+		}
+		if err := entry.Validate(); err != nil {
+			return Workflow{}, fmt.Errorf("%w for job %s: %w", ErrInvalidExecutionContract, id, err)
 		}
 
-		if err := checkReady(ctx, entry); err != nil {
-			return false, fmt.Errorf(
-				"route %q is not ready: %w",
-				entry.CapabilityStream,
-				err,
-			)
+		if status != domain.TaskStatusPending {
+			return Workflow{}, fmt.Errorf("job %s is not pending", id)
 		}
+		if entry.TaskType != taskType {
+			return Workflow{}, fmt.Errorf("job %s task type mismatch: expected %q, got %q", id, entry.TaskType, taskType)
+		}
+		if effectKey == uuid.Nil {
+			return Workflow{}, fmt.Errorf("job %s has no effect key", id)
+		}
+		jobs = append(jobs, JobRow{
+			ID:                id,
+			TaskType:          taskType,
+			EffectKey:         &effectKey,
+			ExecutionContract: &entry,
+			Status:            status,
+		})
 	}
 
 	if err := rows.Err(); err != nil {
-		return false, fmt.Errorf("failed to iterate contracts: %w", err)
+		return Workflow{}, fmt.Errorf("failed to iterate contracts: %w", err)
 	}
 
-	if !hasJobs {
-		return false, ErrEmptyWorkflow
+	if len(jobs) == 0 {
+		return Workflow{}, ErrEmptyWorkflow
+	}
+	type routeKey struct {
+		TaskType         string
+		HandlerVersion   string
+		RouteRevision    int
+		CapabilityStream string
+		ExecutionPool    string
+	}
+	checkedRoutes := make(map[routeKey]struct{}, len(jobs))
+	for _, job := range jobs {
+		entry := *job.ExecutionContract
+		key := routeKey{
+			TaskType:         entry.TaskType,
+			HandlerVersion:   entry.HandlerVersion,
+			RouteRevision:    entry.RouteRevision,
+			CapabilityStream: entry.CapabilityStream,
+			ExecutionPool:    entry.ExecutionPool,
+		}
+		if _, checked := checkedRoutes[key]; checked {
+			continue
+		}
+		if err := checkReady(ctx, entry); err != nil {
+			return Workflow{}, fmt.Errorf("route %q is not ready: %w", entry.CapabilityStream, err)
+		}
+		checkedRoutes[key] = struct{}{}
+	}
+	if err := tx.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&dbNow); err != nil {
+		return Workflow{}, fmt.Errorf("failed to query current database time: %w", err)
+	}
+	if !draftExpiresAt.After(dbNow) {
+		return Workflow{}, ErrDraftExpired
 	}
 
-	return false, errors.New("seal activation is not implemented yet")
+	//Atomic activation
+	sealTime := dbNow
+	ids := make([]uuid.UUID, len(jobs))
+	deadlines := make([]time.Time, len(jobs))
+
+	for i, job := range jobs {
+		ids[i] = job.ID
+		deadlines[i] = sealTime.Add(job.ExecutionContract.MaxJobAge)
+	}
+	_, err = tx.Exec(ctx, `
+		UPDATE processed_jobs AS job
+		SET job_deadline_at = deadline.deadline_at
+		FROM unnest($1::uuid[], $2::timestamptz[]) AS deadline(id, deadline_at)
+		WHERE job.id = deadline.id AND job.workflow_id = $3
+	`, ids, deadlines, workflowID)
+	if err != nil {
+		return Workflow{}, fmt.Errorf("failed to set job deadlines for workflow %s: %w", workflowID, err)
+	}
+
+	// 1. Flip the workflow first; the guard makes sealing idempotent and locks the row.
+	var wf Workflow
+	err = tx.QueryRow(ctx, `
+		UPDATE workflows
+		SET status = $2, updated_at = $3, sealed_at = $3
+		WHERE id = $1 AND sealed_at IS NULL
+		RETURNING id, name, status, tenant_id, sealed_at,
+		          draft_expires_at, created_at, updated_at
+	`, workflowID, domain.WorkflowStatusPending, sealTime).Scan(
+		&wf.ID, &wf.Name, &wf.Status, &wf.TenantID, &wf.SealedAt,
+		&wf.DraftExpiresAt, &wf.CreatedAt, &wf.UpdatedAt,
+	)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Workflow{}, ErrWorkflowNotFoundOrAlreadySealed
+	}
+	if err != nil {
+		return Workflow{}, fmt.Errorf("scan workflow %s: %w", workflowID, err)
+	}
+
+	// 2. Queue root jobs and write their outbox rows in one statement.
+	if _, err := tx.Exec(ctx, `
+		WITH queued AS (
+			UPDATE processed_jobs AS job
+			SET status = $2
+			WHERE job.workflow_id = $1
+			  AND job.status = $3
+			  AND NOT EXISTS (
+				SELECT 1 FROM job_dependencies edge
+				WHERE edge.child_job_id = job.id
+			  )
+			RETURNING job.id, job.execution_contract->>'capability_stream' AS queue_name
+		)
+		INSERT INTO outbox (task_id, queue_name, delivery_id, generation, not_before, delivered)
+		SELECT id, queue_name, gen_random_uuid(), 0, $4, FALSE
+		FROM queued
+		ON CONFLICT (task_id, generation) DO NOTHING
+	`, workflowID, domain.TaskStatusQueued, domain.TaskStatusPending, sealTime); err != nil {
+		return Workflow{}, fmt.Errorf("queue root tasks for workflow %s: %w", workflowID, err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return Workflow{}, fmt.Errorf("commit seal for workflow %s: %w", workflowID, err)
+	}
+	return wf, nil
 }
 
 // CompleteJobAndScheduleChildren durably completes a job and promotes every

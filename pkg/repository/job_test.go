@@ -2,15 +2,149 @@ package repository_test
 
 import (
 	"context"
+	"distributed-queue/internal/domain"
 	"distributed-queue/internal/execution"
 	"distributed-queue/pkg/repository"
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 )
+
+func TestCreateJobValidatesParents(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	ctx := t.Context()
+	contract := referenceContract(t)
+	var workflowID, foreignWorkflowID uuid.UUID
+	for _, id := range []*uuid.UUID{&workflowID, &foreignWorkflowID} {
+		if err := sharedPool.QueryRow(ctx, `
+			INSERT INTO workflows (name, status, draft_expires_at)
+			VALUES ('parent validation', 'DRAFT', clock_timestamp() + INTERVAL '24 hours')
+			RETURNING id
+		`).Scan(id); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parents := make([]uuid.UUID, 3)
+	for i, id := range []uuid.UUID{workflowID, workflowID, foreignWorkflowID} {
+		parent, err := sharedRepo.CreateJob(ctx, contract.CapabilityStream, repository.Task{
+			ID: uuid.New(), WorkflowID: id, TaskType: contract.TaskType,
+			ExecutionContract: contract, EffectKey: uuid.New(),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		parents[i] = parent.ID
+	}
+	taskID := uuid.New()
+	for _, tc := range []struct {
+		name    string
+		parents []uuid.UUID
+	}{
+		{"missing", []uuid.UUID{parents[0], uuid.New()}},
+		{"duplicate", []uuid.UUID{parents[0], parents[0]}},
+		{"self", []uuid.UUID{taskID}},
+		{"foreign workflow", []uuid.UUID{parents[0], parents[2]}},
+		{"valid", parents[:2]},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
+			job, err := sharedRepo.CreateJob(ctx, contract.CapabilityStream, repository.Task{
+				ID: taskID, WorkflowID: workflowID, ParentIDs: tc.parents,
+				TaskType: contract.TaskType, ExecutionContract: contract, EffectKey: uuid.New(),
+			})
+			if tc.name == "valid" {
+				if err != nil {
+					t.Fatal(err)
+				}
+				if !reflect.DeepEqual(job.ParentIDs, tc.parents) {
+					t.Fatalf("expected parents %v, got %v", tc.parents, job.ParentIDs)
+				}
+				return
+			}
+			if !errors.Is(err, repository.ErrInvalidParents) {
+				t.Fatalf("expected ErrInvalidParents, got %v", err)
+			}
+			if !reflect.DeepEqual(job, repository.JobRow{}) {
+				t.Fatalf("invalid parents returned a job: %+v", job)
+			}
+			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
+			if afterJobs != beforeJobs || afterOutbox != beforeOutbox {
+				t.Fatal("invalid parents changed job/outbox counts")
+			}
+		})
+	}
+}
+
+func TestCreateJobWithNullWorkflowExpiry(t *testing.T) {
+	RequireRepositoryIntegration(t)
+	contract := referenceContract(t)
+	for _, status := range []domain.WorkflowStatus{
+		domain.WorkflowStatusDraft,
+		domain.WorkflowStatusCompleted,
+		domain.WorkflowStatusFailed,
+		domain.WorkflowStatusCancelled,
+		domain.WorkflowStatusPending,
+	} {
+		t.Run(string(status), func(t *testing.T) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("CreateJob panicked with NULL workflow expiry: %v", recovered)
+				}
+			}()
+			ctx := t.Context()
+			var workflowID uuid.UUID
+			if err := sharedPool.QueryRow(ctx, `
+				INSERT INTO workflows (name, status, sealed_at, draft_expires_at)
+				VALUES ('NULL expiry regression', $1, NULL, NULL)
+				RETURNING id
+			`, status).Scan(&workflowID); err != nil {
+				t.Fatal(err)
+			}
+			beforeJobs, beforeOutbox := taskSubmissionRowCounts(t)
+			taskID := uuid.New()
+			job, err := sharedRepo.CreateJob(ctx, contract.CapabilityStream, repository.Task{
+				ID: taskID, WorkflowID: workflowID, TaskType: contract.TaskType,
+				ExecutionContract: contract, EffectKey: uuid.New(),
+			})
+			if status == domain.WorkflowStatusPending {
+				if err != nil {
+					t.Fatalf("PENDING workflow with NULL expiry rejected: %v", err)
+				}
+				if job.ID != taskID || job.Status != domain.TaskStatusQueued {
+					t.Errorf("expected queued job %s, got %+v", taskID, job)
+				}
+				beforeJobs++
+				beforeOutbox++
+			} else {
+				if err == nil {
+					t.Errorf("expected %s workflow with NULL expiry to reject job creation", status)
+				}
+				if status == domain.WorkflowStatusDraft && !errors.Is(err, repository.ErrDraftExpired) {
+					t.Errorf("expected ErrDraftExpired, got %v", err)
+				}
+				if !reflect.DeepEqual(job, repository.JobRow{}) {
+					t.Errorf("rejected workflow returned a job: %+v", job)
+				}
+			}
+			afterJobs, afterOutbox := taskSubmissionRowCounts(t)
+			if afterJobs != beforeJobs || afterOutbox != beforeOutbox {
+				t.Errorf("job/outbox counts = %d/%d, want %d/%d",
+					afterJobs, afterOutbox, beforeJobs, beforeOutbox)
+			}
+			workflow, err := sharedRepo.GetWorkflow(ctx, workflowID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if workflow.Status != status || workflow.SealedAt != nil || workflow.DraftExpiresAt != nil {
+				t.Errorf("job creation changed workflow state: %+v", workflow)
+			}
+		})
+	}
+}
 
 func TestCreateJobReturnsEmptyRowOnRollback(t *testing.T) {
 	RequireRepositoryIntegration(t)
